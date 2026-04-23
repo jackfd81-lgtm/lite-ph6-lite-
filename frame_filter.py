@@ -5,6 +5,7 @@ import hashlib
 import argparse
 from datetime import datetime, timezone
 import numpy as np
+from cram_writer import CRAMWriter
 
 
 def utc_now():
@@ -20,6 +21,7 @@ def sha256_file(path):
 
 
 def jsonl_append(path, obj):
+    # Legacy direct-write kept for standalone use outside CRAMWriter
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
@@ -135,15 +137,19 @@ def validate_packet(packet):
 
 
 class PacketWriter:
+    """Thin wrapper — delegates to CRAMWriter for compliant write path."""
     def __init__(self, log_path):
-        self.log_path = log_path
-        self.packet_seq = 0
+        self._cram = CRAMWriter(log_path, buffer_size=64, flush_every=1)
+
+    @property
+    def packet_seq(self):
+        return self._cram.packet_seq
 
     def write(self, packet):
-        self.packet_seq += 1
-        packet["packet_seq"] = self.packet_seq
-        validate_packet(packet)
-        jsonl_append(self.log_path, packet)
+        self._cram.write(packet)
+
+    def close(self):
+        self._cram.close()
 
 
 def evaluate_frame(frame, prev_gray, bright_min, bright_max, lap_min, motion_max):
@@ -305,6 +311,7 @@ def main():
             "message": "session ended"
         })
 
+    writer.close()
     print(f"Done. Frames processed: {frame_index}")
     print(f"Session ID: {session_id}")
     print(f"Log file: {args.log}")
