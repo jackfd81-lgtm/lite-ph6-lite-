@@ -3,9 +3,62 @@ import cv2
 import json
 import hashlib
 import argparse
+import subprocess
+import threading
+import collections
 from datetime import datetime, timezone
 import numpy as np
 from cram_writer import CRAMWriter
+from ph6lite.advisory_client import ask as llm_ask
+
+
+class AudioCapture:
+    """Captures audio from mic via arecord in a background thread."""
+
+    def __init__(self, device="hw:1,0", rate=16000):
+        self.device = device
+        self.rate = rate
+        self._buf = collections.deque(maxlen=rate * 4)
+        self._lock = threading.Lock()
+        self._proc = None
+        self._thread = None
+        self._running = False
+
+    def start(self):
+        self._proc = subprocess.Popen(
+            ["arecord", "-D", self.device, "-f", "S16_LE",
+             "-r", str(self.rate), "-c", "1", "-t", "raw", "-q"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self):
+        chunk = self.rate // 10 * 2  # 100ms of S16_LE bytes
+        while self._running:
+            data = self._proc.stdout.read(chunk)
+            if not data:
+                break
+            samples = np.frombuffer(data, dtype=np.int16)
+            with self._lock:
+                self._buf.extend(samples.tolist())
+
+    def get_metrics(self, duration_ms=200):
+        n = int(self.rate * duration_ms / 1000)
+        with self._lock:
+            samples = list(self._buf)[-n:] if len(self._buf) >= n else list(self._buf)
+        if not samples:
+            return 0.0, 0.0, False
+        arr = np.array(samples, dtype=np.float32) / 32768.0
+        rms = float(round(float(np.sqrt(np.mean(arr ** 2))), 6))
+        peak = float(round(float(np.max(np.abs(arr))), 6))
+        return rms, peak, peak >= 0.999
+
+    def stop(self):
+        self._running = False
+        if self._proc:
+            self._proc.terminate()
 
 
 def utc_now():
@@ -66,6 +119,7 @@ def validate_packet(packet):
         "pseudo",
         "observation",
         "soso",
+        "audio",
         "session_end",
     }
     if ptype not in allowed:
@@ -107,6 +161,11 @@ def validate_packet(packet):
         for k in required:
             if k not in packet:
                 raise ValueError(f"soso missing {k}")
+
+    if ptype == "audio":
+        for k in ("rms_level", "peak_level", "clipping", "sample_rate", "duration_ms"):
+            if k not in packet:
+                raise ValueError(f"audio missing {k}")
 
     if ptype == "config":
         required = [
@@ -197,12 +256,35 @@ def main():
     ap.add_argument("--lap_min", type=float, default=40.0)
     ap.add_argument("--motion_max", type=float, default=0.15)
     ap.add_argument("--max_frames", type=int, default=300, help="0 means unlimited")
+    ap.add_argument("--probe_id", default="", help="probe identifier stamped into every packet")
+    ap.add_argument("--llm", action="store_true", help="enable LLM advisory via Ollama (local or Jetson)")
+    ap.add_argument("--width", type=int, default=0, help="capture width (0=camera default)")
+    ap.add_argument("--height", type=int, default=0, help="capture height (0=camera default)")
+    ap.add_argument("--fps", type=int, default=0, help="capture fps (0=camera default)")
+    ap.add_argument("--signal_frames", default="", help="comma-separated frame indices to print COVER/UNCOVER cues")
+    ap.add_argument("--audio", action="store_true", help="capture audio from camera mic and emit audio packets")
+    ap.add_argument("--audio_device", default="hw:1,0", help="ALSA device for mic (default hw:1,0)")
     args = ap.parse_args()
 
-    source = args.camera if args.source == "0" else args.source
-    cap = cv2.VideoCapture(source)
+    is_url = isinstance(args.source, str) and args.source.startswith("http")
+    source = args.source if is_url else (args.camera if args.source == "0" else args.source)
+    if is_url:
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    else:
+        cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open source: {source}")
+    if args.width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    if args.height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    if args.fps:
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+    audio_cap = None
+    if args.audio:
+        audio_cap = AudioCapture(device=args.audio_device)
+        audio_cap.start()
 
     session_id = make_session_id()
     writer = PacketWriter(args.log)
@@ -219,6 +301,7 @@ def main():
         "ts_utc": utc_now(),
         "session_id": session_id,
         "source": str(source),
+        "probe_id": args.probe_id,
         "save_mode": args.save_mode,
         "bright_min": args.bright_min,
         "bright_max": args.bright_max,
@@ -229,6 +312,8 @@ def main():
 
     prev_gray = None
     frame_index = 0
+    continuity_count = 0
+    confidence = 0.5
 
     try:
         while True:
@@ -254,6 +339,7 @@ def main():
                 "packet_type": "pseudo",
                 "ts_utc": ts,
                 "frame_index": frame_index,
+                "probe_id": args.probe_id,
                 "mean_brightness": mb,
                 "laplacian_var": lv,
                 "motion_fraction": mf,
@@ -265,6 +351,7 @@ def main():
                 "packet_type": "observation",
                 "ts_utc": ts,
                 "frame_index": frame_index,
+                "probe_id": args.probe_id,
                 "image_path": saved_path,
                 "image_sha256": saved_hash,
                 "width": int(frame.shape[1]),
@@ -272,29 +359,70 @@ def main():
             }
 
             if verdict == "PASS":
-                state = "stable"
+                continuity_count += 1
+                confidence = min(0.99, confidence + 0.05)
+                if continuity_count >= 10:
+                    state = "stable"
+                else:
+                    state = "recovering" if continuity_count > 1 else "warming_up"
                 advisory = "continue"
-                confidence = 0.9
-                continuity_count = 1
             else:
+                continuity_count = 0
+                confidence = max(0.1, confidence - 0.3)
                 state = "degraded"
                 advisory = "review_thresholds"
-                confidence = 0.5
-                continuity_count = 0
+
+            llm_backend = None
+            if args.llm and verdict == "DROP":
+                prompt = (
+                    f"Frame {frame_index} dropped. "
+                    f"brightness={mb:.1f} sharpness={lv:.1f} motion={mf:.3f} "
+                    f"reasons={reasons}. "
+                    "One-sentence advisory for the operator."
+                )
+                result = llm_ask("reason", prompt)
+                advisory = result.get("output", advisory).strip() or advisory
+                llm_backend = result.get("backend")
 
             soso = {
                 "packet_type": "soso",
                 "ts_utc": ts,
                 "frame_index": frame_index,
+                "probe_id": args.probe_id,
                 "state": state,
                 "continuity_count": continuity_count,
                 "confidence": confidence,
                 "advisory": advisory,
             }
+            if llm_backend:
+                soso["llm_backend"] = llm_backend
 
             writer.write(pseudo)
             writer.write(obs)
             writer.write(soso)
+
+            if audio_cap:
+                rms, peak, clipping = audio_cap.get_metrics(duration_ms=200)
+                writer.write({
+                    "packet_type": "audio",
+                    "ts_utc": ts,
+                    "frame_index": frame_index,
+                    "probe_id": args.probe_id,
+                    "rms_level": rms,
+                    "peak_level": peak,
+                    "clipping": clipping,
+                    "sample_rate": audio_cap.rate,
+                    "duration_ms": 200,
+                })
+
+            if args.signal_frames:
+                signals = [int(x) for x in args.signal_frames.split(",")]
+                if frame_index == signals[0]:
+                    print(f">>> COVER LENS NOW (frame {frame_index})", flush=True)
+                elif len(signals) > 1 and frame_index == signals[1]:
+                    print(f">>> UNCOVER LENS NOW (frame {frame_index})", flush=True)
+
+            print(f"f={frame_index:3d}  {verdict}  {state:<12}  conf={confidence:.2f}  cont={continuity_count}", flush=True)
 
             prev_gray = gray
 
@@ -303,6 +431,8 @@ def main():
 
     finally:
         cap.release()
+        if audio_cap:
+            audio_cap.stop()
         writer.write({
             "packet_type": "session_end",
             "ts_utc": utc_now(),

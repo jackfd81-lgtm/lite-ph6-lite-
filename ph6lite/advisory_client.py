@@ -43,5 +43,5 @@ def _ask_local(mode: str, prompt: str) -> dict:
             data = json.loads(resp.read())
             return {"status": "ok", "backend": "local", "model": model,
                     "output": data.get("response", "")}
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
         return {"status": "error", "backend": "local", "error": str(e), "output": ""}

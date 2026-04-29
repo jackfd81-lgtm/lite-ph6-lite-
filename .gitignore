@@ -1,9 +1,12 @@
+frames*/
+logs/
 __pycache__/
 *.py[cod]
+*.pyc
+*.tmp
 *.egg-info/
 dist/
 build/
 .env
 *.log
 *.jsonl
-*.tmp

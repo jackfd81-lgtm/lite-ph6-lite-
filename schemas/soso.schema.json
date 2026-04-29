@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ph6-cram/v2.2/soso",
+  "title": "soso (state-of-stream observation) packet",
+  "type": "object",
+  "required": [
+    "packet_type", "ts_utc", "packet_seq", "frame_index",
+    "state", "continuity_count", "confidence", "advisory"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "packet_type":      { "const": "soso" },
+    "ts_utc":           { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$" },
+    "packet_seq":       { "type": "integer", "minimum": 1 },
+    "frame_index":      { "type": "integer", "minimum": 1 },
+    "state":            { "type": "string", "enum": ["stable", "degraded", "unknown"] },
+    "continuity_count": { "type": "integer", "minimum": 0 },
+    "confidence":       { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+    "advisory":         { "type": "string", "minLength": 1 },
+    "llm_backend":      { "type": "string" }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ph6-cram/v2.2/config",
+  "title": "config packet",
+  "type": "object",
+  "required": [
+    "packet_type", "ts_utc", "packet_seq", "session_id",
+    "source", "save_mode",
+    "bright_min", "bright_max", "lap_min", "motion_max", "max_frames"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "packet_type": { "const": "config" },
+    "ts_utc":      { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$" },
+    "packet_seq":  { "type": "integer", "minimum": 1 },
+    "session_id":  { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "source":      { "type": "string" },
+    "save_mode":   { "type": "string", "enum": ["pass_only", "all", "none"] },
+    "bright_min":  { "type": "number", "minimum": 0, "maximum": 255 },
+    "bright_max":  { "type": "number", "minimum": 0, "maximum": 255 },
+    "lap_min":     { "type": "number", "minimum": 0 },
+    "motion_max":  { "type": "number", "minimum": 0, "maximum": 1 },
+    "max_frames":  { "type": "integer", "minimum": 0 }
+  }
+}

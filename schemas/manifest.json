@@ -1,0 +1,20 @@
+{
+  "schema_pack": "ph6-cram-v2.2",
+  "created": "2026-04-23",
+  "packet_types": [
+    "session_start",
+    "config",
+    "pseudo",
+    "observation",
+    "soso",
+    "session_end"
+  ],
+  "schemas": {
+    "session_start": "session_start.schema.json",
+    "config":        "config.schema.json",
+    "pseudo":        "pseudo.schema.json",
+    "observation":   "observation.schema.json",
+    "soso":          "soso.schema.json",
+    "session_end":   "session_end.schema.json"
+  }
+}

@@ -151,7 +151,7 @@ def _validate_packet(packet):
             raise ValueError(f"missing {field}")
 
     ptype = packet["packet_type"]
-    allowed = {"session_start", "config", "pseudo", "observation", "soso", "session_end"}
+    allowed = {"session_start", "config", "pseudo", "observation", "soso", "audio", "session_end"}
     if ptype not in allowed:
         raise ValueError(f"invalid packet_type: {ptype}")
 
@@ -180,6 +180,11 @@ def _validate_packet(packet):
         for k in ("state", "continuity_count", "confidence", "advisory"):
             if k not in packet:
                 raise ValueError(f"soso missing {k}")
+
+    if ptype == "audio":
+        for k in ("rms_level", "peak_level", "clipping", "sample_rate", "duration_ms"):
+            if k not in packet:
+                raise ValueError(f"audio missing {k}")
 
     if ptype == "config":
         for k in ("session_id", "source", "save_mode", "bright_min",
