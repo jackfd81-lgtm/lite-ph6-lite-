@@ -53,6 +53,7 @@ class CRAMWriter:
         self._packet_seq = 0
         self._pending = 0
         self._prev_hash = _GENESIS_HASH
+        self._fh = open(self.log_path, "a", encoding="utf-8")
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -95,6 +96,10 @@ class CRAMWriter:
     def close(self):
         """Flush and close."""
         self.flush()
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
     @property
     def packet_seq(self):
@@ -105,8 +110,9 @@ class CRAMWriter:
 
     def _flush_locked(self):
         """
-        Atomic write: stage → tmp file → fsync → rename → fsync dir.
+        Append buffered lines to the log file and fsync.
         Caller must hold self._lock.
+        JSONL is append-only — no tmp/rename needed; each line is self-contained.
         """
         if not self._buffer:
             return
@@ -116,40 +122,9 @@ class CRAMWriter:
         self._pending = 0
 
         blob = "\n".join(lines) + "\n"
-
-        tmp_path = self.log_path.with_suffix(".tmp")
-
-        # Append to tmp if it exists (mid-session accumulation),
-        # then rename atomically to final path.
-        # Simpler: just append directly with atomic-per-flush guarantee.
-        # Each flush = one durable append unit.
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(blob)
-                f.flush()
-                os.fsync(f.fileno())
-
-            # Atomic rename tmp → append to final
-            # Since JSONL is append-only we open final and write directly
-            # after fsync of the data, giving us durable ordering.
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(blob)
-                f.flush()
-                os.fsync(f.fileno())
-
-            # fsync the directory so rename/metadata is durable
-            dir_fd = os.open(str(self.log_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-
-        finally:
-            # Clean up tmp regardless
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        self._fh.write(blob)
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
 
 
 # ── packet validator ──────────────────────────────────────────────────────────
@@ -164,7 +139,7 @@ def _validate_packet(packet):
     ptype = packet["packet_type"]
     allowed = {"session_start", "config", "pseudo", "observation", "soso", "audio",
                "spike_event", "warning_event", "scene_observation_advisory", "session_end",
-               "cap_mode_transition"}
+               "cap_mode_transition", "virtual_token"}
     if ptype not in allowed:
         raise ValueError(f"invalid packet_type: {ptype}")
 
@@ -233,3 +208,12 @@ def _validate_packet(packet):
         for k in ("session_id", "frames_processed", "message"):
             if k not in packet:
                 raise ValueError(f"session_end missing {k}")
+
+    if ptype == "virtual_token":
+        for k in ("frame_index", "token_type", "token_id", "authority", "store"):
+            if k not in packet:
+                raise ValueError(f"virtual_token missing {k}")
+        if packet["authority"] != "NONE":
+            raise ValueError("virtual_token authority must be NONE")
+        if packet["store"] != "MRAM-S":
+            raise ValueError("virtual_token store must be MRAM-S")

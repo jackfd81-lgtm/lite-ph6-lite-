@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import json
 import wave
@@ -7,11 +8,13 @@ import argparse
 import subprocess
 import threading
 import collections
+import statistics
 from pathlib import Path
 from datetime import datetime, timezone
 import numpy as np
 from cram_writer import CRAMWriter
 from ph6lite.advisory_client import ask as llm_ask
+from virtual_tokens import VirtualTokenTracker
 
 # PH6-LITE MOTION PRESERVATION INVARIANT
 # Capture continues regardless of verdict, motion level, blur, darkness, or audio intensity.
@@ -520,7 +523,7 @@ def _frames_to_ts(fi, fps):
 
 def generate_postrun_report(run_dir, session_id, start_time, end_time,
                              frame_index, pass_count, drop_count,
-                             spike_log_path, baseline, log_path=None):
+                             spike_log_path, baseline, log_path=None, timing=None):
     duration_s = (end_time - start_time).total_seconds()
     fps = round(frame_index / duration_s, 1) if duration_s > 0 else 0
 
@@ -724,6 +727,75 @@ def generate_postrun_report(run_dir, session_id, start_time, end_time,
     for label in scene_labels:
         lines.append(f"- {label}")
 
+    # Hot path timing
+    if timing:
+        def _pct(arr, p):
+            if not arr:
+                return 0.0
+            return round(sorted(arr)[int(len(arr) * p / 100)], 2)
+
+        lines += [
+            "",
+            "## Hot Path Timing",
+            f"> n={len(timing.get('loop_total', []))} frames",
+            "",
+            "| Stage | p50 ms | p95 ms | max ms |",
+            "|---|---|---|---|",
+        ]
+        for _label, _key in [
+            ("capture",    "capture"),
+            ("evaluate",   "evaluate"),
+            ("build",      "build"),
+            ("write (3)",  "write3"),
+            ("spikewatch", "spikewatch"),
+            ("loop_total", "loop_total"),
+        ]:
+            arr = timing.get(_key, [])
+            if arr:
+                lines.append(
+                    f"| {_label} | {_pct(arr,50)} | {_pct(arr,95)} | {max(arr)} |"
+                )
+
+    # Virtual token analysis
+    _vt_rt = _vt_vdt = _vt_vlt = _vt_closed = 0
+    if log_path and os.path.exists(str(log_path)):
+        try:
+            for _line in open(str(log_path)):
+                _line = _line.strip()
+                if not _line or "virtual_token" not in _line:
+                    continue
+                _p = json.loads(_line)
+                if _p.get("packet_type") != "virtual_token":
+                    continue
+                _tt = _p.get("token_type", "")
+                _st = _p.get("state", "active")
+                if _st == "closed":
+                    _vt_closed += 1
+                elif _tt == "RT":
+                    _vt_rt += 1
+                elif _tt == "VDT":
+                    _vt_vdt += 1
+                elif _tt == "VLT":
+                    _vt_vlt += 1
+        except Exception:
+            pass
+
+    lines += [
+        "",
+        "## Virtual Token Analysis",
+        "> Authority: NONE | Store: MRAM-S | Advisory continuity tracking only",
+        "",
+        "| Token Type | Count |",
+        "|---|---|",
+        f"| RT (evidence anchors) | {_vt_rt} |",
+        f"| VDT (continuity candidates) | {_vt_vdt} |",
+        f"| VLT (stabilized continuity) | {_vt_vlt} |",
+        f"| Closed tokens | {_vt_closed} |",
+        "",
+        "> Virtual tokens tracked advisory event continuity only.",
+        "> No virtual token had authority over Pseudo, CAP, CRAM, or recording control.",
+    ]
+
     # Pseudo / SoSo separation analysis
     _sep = {"pseudo_count": 0, "soso_count": 0, "shared_frames": 0,
             "pseudo_leakage": 0, "soso_leakage": 0, "order_violations": 0}
@@ -896,12 +968,23 @@ def main():
     audio_history     = collections.deque(maxlen=60)
     bright_history    = collections.deque(maxlen=60)
     cap_state         = CAPState()
+    token_tracker     = VirtualTokenTracker()
     _soso_window      = collections.deque(maxlen=30)   # True=DROP, for recent_instability_count
+
+    # timing accumulators — per-stage, in milliseconds
+    _tm_capture  = []
+    _tm_evaluate = []
+    _tm_build    = []
+    _tm_write    = []
+    _tm_spike    = []
+    _tm_loop     = []
     recovery_count    = 0
 
     try:
         while True:
+            _t0 = time.perf_counter()
             ok, frame = cap.read()
+            _t_capture = time.perf_counter()
             if not ok:
                 break
 
@@ -916,6 +999,7 @@ def main():
 
             gray, mb, lv, mf, verdict, reasons = evaluate_frame(
                 frame, prev_gray, args.bright_min, args.bright_max, args.lap_min, args.motion_max)
+            _t_evaluate = time.perf_counter()
 
             ts          = utc_now()
             saved_path  = None
@@ -1002,10 +1086,12 @@ def main():
                     "advisory": advisory, "authority": "NONE"}
             if llm_backend:
                 soso["llm_backend"] = llm_backend
+            _t_build = time.perf_counter()
 
             writer.write(pseudo)
             writer.write(obs)
             writer.write(soso)
+            _t_write = time.perf_counter()
 
             rms, peak, clipping = 0.0, 0.0, False
             if audio_cap:
@@ -1024,6 +1110,7 @@ def main():
                 print(f"       ~~ WARN {presoak['warnings']}  score={presoak['presoak_score']}", flush=True)
 
             # spike detection
+            _t_spike0 = time.perf_counter()
             spike = detect_spikes(frame_index, ts, metrics, baseline)
             update_baseline(baseline, metrics)
             prev_metrics = metrics
@@ -1044,6 +1131,32 @@ def main():
                 traffic    = "RED" if spike["severity"] in ("HIGH", "ALERT") else "YELLOW"
             spike_strip_window.append(spike_char)
             strip = "".join(spike_strip_window).rjust(16, ".")
+
+            # virtual token observation — advisory only, no authority
+            if spike:
+                for _s in spike["spikes"]:
+                    if "MOTION" in _s:
+                        _ekind = "motion"
+                    elif "BLUR" in _s:
+                        _ekind = "blur"
+                    elif "UNDERLIGHT" in _s:
+                        _ekind = "underlight"
+                    elif "OVERLIGHT" in _s:
+                        _ekind = "overlight"
+                    elif "SOUND" in _s:
+                        _ekind = "sound"
+                    elif "COMBINED" in _s:
+                        continue  # combined is a tag, not a separate event kind
+                    else:
+                        _ekind = "combined"
+                    for _tp in token_tracker.observe_event(frame_index, _ekind, ts):
+                        writer.write(_tp)
+            if verdict == "DROP":
+                for _tp in token_tracker.observe_event(frame_index, "degraded", ts):
+                    writer.write(_tp)
+            for _tp in token_tracker.close_expired(frame_index, ts):
+                writer.write(_tp)
+            _t_spike1 = time.perf_counter()
 
             # CAP mode update — pass is_drop so density counts include DROP frames
             cap_pkt = cap_state.update(frame_index, spike, presoak, is_drop=(verdict == "DROP"))
@@ -1098,6 +1211,15 @@ def main():
                 print(f"f={frame_index:4d}  CAP:EVENT_BURST  [{strip}]  {traffic}  (quiet terminal)", flush=True)
 
             prev_gray = gray
+            _t_loop_end = time.perf_counter()
+            _ms = lambda a, b: round((b - a) * 1000, 2)
+            _tm_capture.append(_ms(_t0, _t_capture))
+            _tm_evaluate.append(_ms(_t_capture, _t_evaluate))
+            _tm_build.append(_ms(_t_evaluate, _t_build))
+            _tm_write.append(_ms(_t_build, _t_write))
+            _tm_spike.append(_ms(_t_spike0, _t_spike1))
+            _tm_loop.append(_ms(_t0, _t_loop_end))
+
             if args.max_frames and frame_index >= args.max_frames:
                 break
 
@@ -1135,6 +1257,24 @@ def main():
     duration_s = (end_time - start_time).total_seconds()
     fps_actual = round(frame_index / duration_s, 1) if duration_s > 0 else 0
     total_spikes = sum(v for k, v in spike_counts.items() if k != "SPIKE_COMBINED")
+
+    def _pct(arr, p):
+        if not arr:
+            return 0.0
+        return round(sorted(arr)[int(len(arr) * p / 100)], 2)
+
+    print(f"\n── Per-Stage Timing (ms, n={len(_tm_loop)}) ──────────────────────────")
+    print(f"  {'stage':<16}  {'p50':>7}  {'p95':>7}  {'max':>7}")
+    for _label, _arr in [
+        ("capture",   _tm_capture),
+        ("evaluate",  _tm_evaluate),
+        ("build",     _tm_build),
+        ("write(3)",  _tm_write),
+        ("spikewatch",_tm_spike),
+        ("loop_total",_tm_loop),
+    ]:
+        if _arr:
+            print(f"  {_label:<16}  {_pct(_arr,50):>7}  {_pct(_arr,95):>7}  {max(_arr):>7}")
 
     print(f"\nDone. Frames: {frame_index}  FPS: {fps_actual}  Duration: {duration_s:.1f}s")
     print(f"Run dir:    {run_dir}")
@@ -1198,7 +1338,15 @@ def main():
             summary_path, report_path = generate_postrun_report(
                 post_dir, session_id, start_time, end_time,
                 frame_index, pass_count, drop_count, spike_log_path, baseline,
-                log_path=log_path)
+                log_path=log_path,
+                timing={
+                    "capture":    _tm_capture,
+                    "evaluate":   _tm_evaluate,
+                    "build":      _tm_build,
+                    "write3":     _tm_write,
+                    "spikewatch": _tm_spike,
+                    "loop_total": _tm_loop,
+                })
             print(f"  Summary: {summary_path}")
             print(f"  Report:  {report_path}")
         except Exception as _e:
