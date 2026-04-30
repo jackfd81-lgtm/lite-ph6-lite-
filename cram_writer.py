@@ -19,9 +19,12 @@ Invariants:
 
 import os
 import json
+import hashlib
 import threading
 import collections
 from pathlib import Path
+
+_GENESIS_HASH = "0" * 128  # 64-byte blake2b = 128 hex chars
 
 
 class CRAMWriter:
@@ -49,6 +52,7 @@ class CRAMWriter:
         self._lock = threading.Lock()
         self._packet_seq = 0
         self._pending = 0
+        self._prev_hash = _GENESIS_HASH
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -61,6 +65,13 @@ class CRAMWriter:
             self._packet_seq += 1
             packet["packet_seq"] = self._packet_seq
             _validate_packet(packet)
+
+            # Hash chain: hash canonical JSON (with prev_hash, without packet_hash)
+            packet["prev_hash"] = self._prev_hash
+            canonical = json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            packet_hash = hashlib.blake2b(canonical.encode()).hexdigest()
+            packet["packet_hash"] = packet_hash
+            self._prev_hash = packet_hash
 
             # Backpressure: block until buffer has room
             while len(self._buffer) >= self.buffer_size:
@@ -151,7 +162,9 @@ def _validate_packet(packet):
             raise ValueError(f"missing {field}")
 
     ptype = packet["packet_type"]
-    allowed = {"session_start", "config", "pseudo", "observation", "soso", "audio", "session_end"}
+    allowed = {"session_start", "config", "pseudo", "observation", "soso", "audio",
+               "spike_event", "warning_event", "scene_observation_advisory", "session_end",
+               "cap_mode_transition"}
     if ptype not in allowed:
         raise ValueError(f"invalid packet_type: {ptype}")
 
@@ -196,6 +209,25 @@ def _validate_packet(packet):
         for k in ("session_id", "message"):
             if k not in packet:
                 raise ValueError(f"session_start missing {k}")
+
+    if ptype == "spike_event":
+        for k in ("frame_index", "spikes", "severity", "spike_score", "metrics"):
+            if k not in packet:
+                raise ValueError(f"spike_event missing {k}")
+        if not isinstance(packet["spikes"], list):
+            raise ValueError("spike_event spikes must be list")
+
+    if ptype == "warning_event":
+        for k in ("frame_index", "warnings", "presoak_score", "metrics"):
+            if k not in packet:
+                raise ValueError(f"warning_event missing {k}")
+        if not isinstance(packet["warnings"], list):
+            raise ValueError("warning_event warnings must be list")
+
+    if ptype == "scene_observation_advisory":
+        for k in ("frame_index", "authority", "store"):
+            if k not in packet:
+                raise ValueError(f"scene_observation_advisory missing {k}")
 
     if ptype == "session_end":
         for k in ("session_id", "frames_processed", "message"):
