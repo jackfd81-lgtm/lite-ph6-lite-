@@ -21,6 +21,15 @@ HAILO_SEND_EVERY_N = 5
 HAILO_JPEG_QUALITY = 70
 from ph6lite.advisory_client import ask as llm_ask
 from virtual_tokens import VirtualTokenTracker
+from soso_swarm_lite import SoSoSwarmLite
+from postrun_soso_swarm_summary import run_soso_swarm_postrun, print_swarm_summary
+
+_SWARM_REASON_TO_EVENT = {
+    "brightness_low":  "underlight",
+    "brightness_high": "overlight",
+    "blur_low_detail": "blur",
+    "motion_high":     "motion",
+}
 
 # PH6-LITE MOTION PRESERVATION INVARIANT
 # Capture continues regardless of verdict, motion level, blur, darkness, or audio intensity.
@@ -451,6 +460,49 @@ def make_session_id():
     return hashlib.sha256(seed).hexdigest()[:16]
 
 
+def parse_phases(phase_spec: str) -> list[dict]:
+    """Parse --phases string into deterministic frame ranges.
+
+    Format: "quiet:0-300,camera:301-600,music:601-900"
+    Returns sorted list of {"name", "start", "end"} dicts.
+    """
+    phases: list[dict] = []
+    if not phase_spec:
+        return phases
+    for raw in phase_spec.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Invalid phase entry (missing ':'): {part!r}")
+        name, frame_range = part.split(":", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"Empty phase name in entry: {part!r}")
+        if "-" not in frame_range:
+            raise ValueError(f"Invalid frame range in phase entry: {part!r}")
+        start_s, end_s = frame_range.split("-", 1)
+        try:
+            start, end = int(start_s), int(end_s)
+        except ValueError as exc:
+            raise ValueError(f"Non-integer frame range in phase entry: {part!r}") from exc
+        if start < 0:
+            raise ValueError(f"Phase start cannot be negative: {part!r}")
+        if end < start:
+            raise ValueError(f"Phase end must be >= start: {part!r}")
+        phases.append({"name": name, "start": start, "end": end})
+    phases.sort(key=lambda p: (p["start"], p["end"], p["name"]))
+    return phases
+
+
+def get_active_phase(frame_index: int, phases: list[dict]) -> str:
+    """Return the active phase name, or 'unphased' if no range matches."""
+    for phase in phases:
+        if phase["start"] <= frame_index <= phase["end"]:
+            return phase["name"]
+    return "unphased"
+
+
 # ── spike detection ───────────────────────────────────────────────────────────
 
 _SPIKE_CHARS = {
@@ -743,7 +795,8 @@ def _frames_to_ts(fi, fps):
 
 def generate_postrun_report(run_dir, session_id, start_time, end_time,
                              frame_index, pass_count, drop_count,
-                             spike_log_path, baseline, log_path=None, timing=None):
+                             spike_log_path, baseline, log_path=None, timing=None,
+                             swarm_log_path=None):
     duration_s = (end_time - start_time).total_seconds()
     fps = round(frame_index / duration_s, 1) if duration_s > 0 else 0
 
@@ -1016,6 +1069,59 @@ def generate_postrun_report(run_dir, session_id, start_time, end_time,
         "> No virtual token had authority over Pseudo, CAP, CRAM, or recording control.",
     ]
 
+    # Phase summary — only emitted if packets carry a "phase" field
+    if log_path and os.path.exists(str(log_path)):
+        try:
+            _phase_stats: dict = {}
+            for _pline in open(str(log_path)):
+                _pline = _pline.strip()
+                if not _pline:
+                    continue
+                _ppkt = json.loads(_pline)
+                _ph   = _ppkt.get("phase")
+                if _ph is None:
+                    continue
+                if _ph not in _phase_stats:
+                    _phase_stats[_ph] = {
+                        "frames": 0, "passes": 0, "drops": 0,
+                        "spike_types": collections.Counter(),
+                        "tokens": collections.Counter(),
+                    }
+                _st = _phase_stats[_ph]
+                _pt = _ppkt.get("packet_type")
+                if _pt == "pseudo":
+                    _st["frames"] += 1
+                    if _ppkt.get("verdict") == "PASS":
+                        _st["passes"] += 1
+                    elif _ppkt.get("verdict") == "DROP":
+                        _st["drops"] += 1
+                elif _pt == "spike_event":
+                    for _sk in _ppkt.get("spikes", []):
+                        _st["spike_types"][_sk] += 1
+                elif _pt == "virtual_token" and _ppkt.get("state") != "closed":
+                    _st["tokens"][_ppkt.get("token_type", "")] += 1
+            if _phase_stats:
+                lines += ["", "## Phase Summary", "> Advisory only — metadata labels, no authority", ""]
+                for _ph_name, _st in _phase_stats.items():
+                    _dom = _st["spike_types"].most_common(1)
+                    _dom_str = _dom[0][0] if _dom else "NONE"
+                    lines += [
+                        f"### {_ph_name}",
+                        f"| Field | Value |",
+                        f"|---|---|",
+                        f"| Frames | {_st['frames']} |",
+                        f"| PASS | {_st['passes']} |",
+                        f"| DROP | {_st['drops']} |",
+                        f"| Spike events | {sum(_st['spike_types'].values())} |",
+                        f"| Dominant spike | {_dom_str} |",
+                        f"| RT tokens | {_st['tokens'].get('RT', 0)} |",
+                        f"| VDT tokens | {_st['tokens'].get('VDT', 0)} |",
+                        f"| VLT tokens | {_st['tokens'].get('VLT', 0)} |",
+                        "",
+                    ]
+        except Exception:
+            pass
+
     # Pseudo / SoSo separation analysis
     _sep = {"pseudo_count": 0, "soso_count": 0, "shared_frames": 0,
             "pseudo_leakage": 0, "soso_leakage": 0, "order_violations": 0}
@@ -1081,6 +1187,61 @@ def generate_postrun_report(run_dir, session_id, start_time, end_time,
             lines.append(f"> WARNING: {_sep['soso_leakage']} SoSo packet(s) contain verdict/measurement fields.")
         if _sep["order_violations"] > 0:
             lines.append(f"> WARNING: {_sep['order_violations']} frame(s) have SoSo packet before Pseudo packet.")
+    # SoSo Swarm Lite analysis
+    _sw_rt = _sw_vdt = _sw_vlt = 0
+    _sw_by_event: collections.Counter = collections.Counter()
+    _sw_strength_by_event: collections.Counter = collections.Counter()
+    if swarm_log_path and os.path.exists(str(swarm_log_path)):
+        try:
+            for _line in open(str(swarm_log_path)):
+                _line = _line.strip()
+                if not _line:
+                    continue
+                _p = json.loads(_line)
+                _tt = _p.get("token_type", "")
+                _et = _p.get("event_type", "unknown")
+                if _tt == "RT":
+                    _sw_rt += 1
+                elif _tt == "VDT":
+                    _sw_vdt += 1
+                elif _tt == "VLT":
+                    _sw_vlt += 1
+                _sw_by_event[_et] += 1
+                _sw_strength_by_event[_et] = max(
+                    _sw_strength_by_event[_et], _p.get("strength", 1)
+                )
+        except Exception:
+            pass
+
+    _sw_total = _sw_rt + _sw_vdt + _sw_vlt
+    _sw_strongest = _sw_by_event.most_common(1)[0] if _sw_by_event else ("none", 0)
+    _sw_longest   = _sw_strength_by_event.most_common(1)[0] if _sw_strength_by_event else ("none", 0)
+
+    lines += [
+        "",
+        "## SoSo Swarm Lite Analysis",
+        "> Authority: NONE | Store: MRAM-S | Lane: LANE_2 | Advisory continuity only",
+        "",
+        "| Token Type | Count |",
+        "|---|---|",
+        f"| RT (reference anchors) | {_sw_rt} |",
+        f"| VDT (decay continuity) | {_sw_vdt} |",
+        f"| VLT (longevity stabilized) | {_sw_vlt} |",
+        f"| Total swarm tokens | {_sw_total} |",
+        "",
+    ]
+    if _sw_total > 0:
+        lines += [
+            f"- **Strongest event type:** `{_sw_strongest[0]}` ({_sw_strongest[1]} tokens)",
+            f"- **Longest advisory chain:** `{_sw_longest[0]}` (peak strength {_sw_longest[1]})",
+            "",
+            "> **Authority confirmation:** SoSo Swarm Lite had NONE authority during this session.",
+            "> Token output was written to MRAM-S only. No effect on PSEUDO verdicts, PASS/DROP thresholds,",
+            "> CRAM commits, EvidencePackets, or replay dependencies.",
+        ]
+    else:
+        lines += ["> No swarm tokens emitted during this session (no DROP frames or swarm disabled)."]
+
     lines += ["", "---", "*Generated by PH6-LITE-POSTRUN-v0.3. Advisory only.*", ""]
 
     report_path = run_dir / "postrun_report.md"
@@ -1119,7 +1280,21 @@ def main():
     ap.add_argument("--hailo_node",   default="", help="AI node URL e.g. http://192.168.10.2:8000/process")
     ap.add_argument("--status_path",  default=str(Path.home() / "ph6_status/status.json"),
                     help="path to status.json for display loop")
+    ap.add_argument("--phases",       default="",
+                    help="phase labels: 'quiet:0-300,camera:301-600,music:601-900'")
     args = ap.parse_args()
+
+    # ── phase map ─────────────────────────────────────────────────────────────
+    phases = parse_phases(args.phases)
+    if phases:
+        print("PH6-Lite phased calibration enabled:")
+        for _ph in phases:
+            print(f"  {_ph['name']}: frames {_ph['start']}–{_ph['end']}")
+        _last_phase_frame = max(_ph["end"] for _ph in phases)
+        if args.max_frames and args.max_frames < _last_phase_frame:
+            raise ValueError(
+                f"--max_frames={args.max_frames} ends before final phase frame {_last_phase_frame}"
+            )
 
     # ── run directory — hot/ for live writes, post/ for post-processing ────────
     run_ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1128,6 +1303,9 @@ def main():
     post_dir = run_dir / "post"
     hot_dir.mkdir(parents=True, exist_ok=True)
     post_dir.mkdir(parents=True, exist_ok=True)
+    mram_s_dir = run_dir / "mram_s"
+    mram_s_dir.mkdir(parents=True, exist_ok=True)
+    swarm_log_path = mram_s_dir / "soso_swarm_tokens.jsonl"
 
     log_path       = Path(args.log)       if args.log       else hot_dir / "run_log.jsonl"
     spike_log_path = Path(args.spike_log) if args.spike_log else hot_dir / "spike_events.jsonl"
@@ -1195,6 +1373,7 @@ def main():
     bright_history    = collections.deque(maxlen=60)
     cap_state         = CAPState()
     token_tracker     = VirtualTokenTracker()
+    soso_swarm        = SoSoSwarmLite()
     _soso_window      = collections.deque(maxlen=30)   # True=DROP, for recent_instability_count
     hailo_sender      = HailoSender(args.hailo_node) if args.hailo_node else None
     status_writer     = StatusWriter(args.status_path)
@@ -1209,6 +1388,7 @@ def main():
     _tm_spike    = []
     _tm_loop     = []
     recovery_count    = 0
+    _exit_reason      = "normal"
 
     try:
         while True:
@@ -1216,6 +1396,7 @@ def main():
             ok, frame = cap.read()
             _t_capture = time.perf_counter()
             if not ok:
+                _exit_reason = "camera_loss"
                 break
 
             frame_index += 1
@@ -1256,13 +1437,16 @@ def main():
             soso_delta = compute_soso_delta(
                 _cur_pseudo_metrics, prev_pseudo_metrics, frame_index, prev_frame_id
             )
+            _frame_phase = get_active_phase(frame_index, phases)
             pseudo = {"packet_type": "pseudo", "ts_utc": ts, "frame_index": frame_index,
                       "probe_id": args.probe_id, "mean_brightness": mb, "laplacian_var": lv,
                       "motion_fraction": mf, "verdict": verdict, "reasons": reasons,
+                      "phase": _frame_phase,
                       **pdiag, **_regions}
             obs    = {"packet_type": "observation", "ts_utc": ts, "frame_index": frame_index,
                       "probe_id": args.probe_id, "image_path": saved_path,
-                      "image_sha256": saved_hash, "width": int(frame.shape[1]), "height": int(frame.shape[0])}
+                      "image_sha256": saved_hash, "width": int(frame.shape[1]), "height": int(frame.shape[0]),
+                      "phase": _frame_phase}
 
             if verdict == "PASS":
                 continuity_count += 1
@@ -1325,6 +1509,7 @@ def main():
                     "confidence_reason": conf_reason, "scene_drift_score": scene_drift,
                     "advisory": advisory, "authority": "NONE",
                     "soso_delta": soso_delta}
+            soso["phase"] = _frame_phase
             if llm_backend:
                 soso["llm_backend"] = llm_backend
             _t_build = time.perf_counter()
@@ -1360,7 +1545,8 @@ def main():
             if frame_index % 10 == 0:
                 _fps = round((len(_fps_ts) - 1) / (_fps_ts[-1] - _fps_ts[0]), 1) if len(_fps_ts) > 1 else 0.0
                 _ai_st = hailo_sender.ai_status if hailo_sender else "DISABLED"
-                status_writer.update(status="WORKING", cam="OK", cram="OK",
+                _main_st = "THINKING" if _ai_st == "SENDING" else "WORKING"
+                status_writer.update(status=_main_st, cam="OK", cram="OK",
                                      ai=_ai_st, fps=_fps, frame=frame_index)
 
             rms, peak, clipping = 0.0, 0.0, False
@@ -1392,6 +1578,7 @@ def main():
             spike_char = "."
             traffic    = "GREEN"
             if spike:
+                spike["phase"] = _frame_phase
                 writer.write(spike)
                 with open(spike_log_path, "a", encoding="utf-8") as sf:
                     sf.write(json.dumps(spike, separators=(",", ":")) + "\n")
@@ -1403,6 +1590,7 @@ def main():
             strip = "".join(spike_strip_window).rjust(16, ".")
 
             # virtual token observation — advisory only, no authority
+            # PSEUDO verdict is locked above; tokens observe but never decide
             if spike:
                 for _s in spike["spikes"]:
                     if "MOTION" in _s:
@@ -1420,12 +1608,35 @@ def main():
                     else:
                         _ekind = "combined"
                     for _tp in token_tracker.observe_event(frame_index, _ekind, ts):
+                        _tp["source"] = "SoSo.VirtualTokenTracker"
+                        _tp["phase"]  = _frame_phase
                         writer.write(_tp)
             if verdict == "DROP":
                 for _tp in token_tracker.observe_event(frame_index, "degraded", ts):
+                    _tp["source"] = "SoSo.VirtualTokenTracker"
+                    _tp["phase"]  = _frame_phase
                     writer.write(_tp)
             for _tp in token_tracker.close_expired(frame_index, ts):
+                _tp["source"] = "SoSo.VirtualTokenTracker"
+                _tp["phase"]  = _frame_phase
                 writer.write(_tp)
+
+            # SoSo Swarm Lite — advisory pattern tracking, MRAM-S only, LANE_2
+            # PSEUDO verdict already locked above; swarm observes but never decides
+            if reasons:
+                _seen_swarm: set = set()
+                for _reason in reasons:
+                    _ekind = _SWARM_REASON_TO_EVENT.get(_reason)
+                    if _ekind and _ekind not in _seen_swarm:
+                        _seen_swarm.add(_ekind)
+                        _swarm_pkts = soso_swarm.observe_event(
+                            frame_id=frame_index,
+                            event_type=_ekind,
+                            reasons=reasons,
+                        )
+                        if _swarm_pkts:
+                            soso_swarm.write_mram_s(str(swarm_log_path), _swarm_pkts)
+
             _t_spike1 = time.perf_counter()
 
             # CAP mode update — pass is_drop so density counts include DROP frames
@@ -1496,7 +1707,8 @@ def main():
                 break
 
     finally:
-        status_writer.update(status="DONE", frame=frame_index)
+        _final_st = "ERROR" if _exit_reason == "camera_loss" else "DONE"
+        status_writer.update(status=_final_st, frame=frame_index)
         cap.release()
         if audio_cap:
             audio_cap.stop()
@@ -1626,6 +1838,12 @@ def main():
                 })
             print(f"  Summary: {summary_path}")
             print(f"  Report:  {report_path}")
+            try:
+                _swarm_summary = run_soso_swarm_postrun(run_dir)
+                print_swarm_summary(_swarm_summary)
+                print(f"  Swarm:   {run_dir / 'post' / 'soso_swarm_summary.json'}")
+            except Exception as _se:
+                print(f"  WARN: swarm summary failed: {_se}", flush=True)
         except Exception as _e:
             _post_errors.append(f"report_gen: {_e}")
             print(f"  WARN: report generation failed: {_e}", flush=True)
