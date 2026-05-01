@@ -14,6 +14,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 import numpy as np
 from cram_writer import CRAMWriter
+
+HAILO_QUEUE_SIZE   = 30
+HAILO_TIMEOUT_SEC  = 2
+HAILO_SEND_EVERY_N = 5
+HAILO_JPEG_QUALITY = 70
 from ph6lite.advisory_client import ask as llm_ask
 from virtual_tokens import VirtualTokenTracker
 
@@ -88,22 +93,43 @@ class AudioCapture:
 
 
 class HailoSender:
-    """Async fire-and-forget frame sender to AI node. Never blocks the capture loop."""
+    """Async frame sender to AI node. Never blocks the capture loop.
 
-    def __init__(self, url, max_queue=30):
-        self._url    = url
-        self._q      = queue.Queue(maxsize=max_queue)
-        self._sent   = 0
-        self._dropped = 0
-        self._errors = 0
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+    Sends every Nth frame (HAILO_SEND_EVERY_N). Stores the latest advisory
+    result for the main loop to consume via get_latest_result().
+    """
+
+    def __init__(self, url, max_queue=HAILO_QUEUE_SIZE):
+        self._url           = url
+        self._q             = queue.Queue(maxsize=max_queue)
+        self._sent          = 0
+        self._dropped       = 0
+        self._errors        = 0
+        self._lock          = threading.Lock()
+        self._latest_result = None
+        self._ai_status     = "CHECKING"
+        self._thread        = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
     def send(self, frame_index, jpg_bytes):
         try:
             self._q.put_nowait((frame_index, jpg_bytes))
+            with self._lock:
+                self._ai_status = "SENDING"
         except queue.Full:
             self._dropped += 1
+
+    def get_latest_result(self):
+        """Return and clear the most recent AI result, or None."""
+        with self._lock:
+            result = self._latest_result
+            self._latest_result = None
+            return result
+
+    @property
+    def ai_status(self):
+        with self._lock:
+            return self._ai_status
 
     def _worker(self):
         import requests
@@ -113,14 +139,21 @@ class HailoSender:
                 break
             frame_index, jpg_bytes = item
             try:
-                requests.post(
+                r = requests.post(
                     self._url,
                     files={"file": (f"frame_{frame_index:06d}.jpg", jpg_bytes, "image/jpeg")},
-                    timeout=2,
+                    timeout=HAILO_TIMEOUT_SEC,
                 )
+                result = r.json()
                 self._sent += 1
+                with self._lock:
+                    self._latest_result = result
+                    self._ai_status = "OK"
             except Exception:
                 self._errors += 1
+                with self._lock:
+                    # OFFLINE after 5 consecutive errors, ERROR otherwise
+                    self._ai_status = "OFFLINE" if self._errors >= 5 else "ERROR"
 
     def stop(self):
         self._q.put(None)
@@ -128,6 +161,26 @@ class HailoSender:
 
     def stats(self):
         return {"sent": self._sent, "dropped": self._dropped, "errors": self._errors}
+
+
+class StatusWriter:
+    """Atomically writes status.json. Read-only to the display — no control path."""
+
+    def __init__(self, path):
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._state = {"status": "BOOT", "cam": "UNKNOWN", "cram": "UNKNOWN",
+                       "ai": "UNKNOWN", "fps": 0, "frame": 0}
+        self._flush()
+
+    def update(self, **kwargs):
+        self._state.update(kwargs)
+        self._flush()
+
+    def _flush(self):
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._state))
+        tmp.rename(self._path)
 
 
 def utc_now():
@@ -1064,6 +1117,8 @@ def main():
     ap.add_argument("--profile",      choices=["normal", "diagnostic", "stress", "audit"],
                     default="normal", help="capture profile: normal|diagnostic|stress|audit")
     ap.add_argument("--hailo_node",   default="", help="AI node URL e.g. http://192.168.10.2:8000/process")
+    ap.add_argument("--status_path",  default=str(Path.home() / "ph6_status/status.json"),
+                    help="path to status.json for display loop")
     args = ap.parse_args()
 
     # ── run directory — hot/ for live writes, post/ for post-processing ────────
@@ -1142,6 +1197,9 @@ def main():
     token_tracker     = VirtualTokenTracker()
     _soso_window      = collections.deque(maxlen=30)   # True=DROP, for recent_instability_count
     hailo_sender      = HailoSender(args.hailo_node) if args.hailo_node else None
+    status_writer     = StatusWriter(args.status_path)
+    status_writer.update(status="CHECKING")
+    _fps_ts           = collections.deque(maxlen=30)
 
     # timing accumulators — per-stage, in milliseconds
     _tm_capture  = []
@@ -1277,9 +1335,33 @@ def main():
             _t_write = time.perf_counter()
 
             # CRAM writes first — then async copy to AI node (never blocks)
-            if hailo_sender:
-                _, _jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if hailo_sender and frame_index % HAILO_SEND_EVERY_N == 0:
+                _, _jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, HAILO_JPEG_QUALITY])
                 hailo_sender.send(frame_index, _jpg.tobytes())
+
+            # Consume latest AI result and write advisory soso_ai packet (MRAM-S, authority NONE)
+            if hailo_sender:
+                _ai_result = hailo_sender.get_latest_result()
+                if _ai_result:
+                    writer.write({
+                        "packet_type":    "soso_ai",
+                        "ts_utc":         ts,
+                        "frame_index":    frame_index,
+                        "authority":      "NONE",
+                        "source":         "HAILO_NODE",
+                        "frame_hash":     _ai_result.get("frame_hash"),
+                        "model_name":     _ai_result.get("model_name"),
+                        "semantic_labels": _ai_result.get("labels", []),
+                        "advisory_only":  True,
+                    })
+
+            # FPS + status update every 10 frames
+            _fps_ts.append(time.perf_counter())
+            if frame_index % 10 == 0:
+                _fps = round((len(_fps_ts) - 1) / (_fps_ts[-1] - _fps_ts[0]), 1) if len(_fps_ts) > 1 else 0.0
+                _ai_st = hailo_sender.ai_status if hailo_sender else "DISABLED"
+                status_writer.update(status="WORKING", cam="OK", cram="OK",
+                                     ai=_ai_st, fps=_fps, frame=frame_index)
 
             rms, peak, clipping = 0.0, 0.0, False
             if audio_cap:
@@ -1414,6 +1496,7 @@ def main():
                 break
 
     finally:
+        status_writer.update(status="DONE", frame=frame_index)
         cap.release()
         if audio_cap:
             audio_cap.stop()
