@@ -3,6 +3,7 @@ import time
 import cv2
 import json
 import wave
+import queue
 import hashlib
 import argparse
 import subprocess
@@ -84,6 +85,49 @@ class AudioCapture:
             with self._wav_lock:
                 self._wav.close()
             self._wav = None
+
+
+class HailoSender:
+    """Async fire-and-forget frame sender to AI node. Never blocks the capture loop."""
+
+    def __init__(self, url, max_queue=30):
+        self._url    = url
+        self._q      = queue.Queue(maxsize=max_queue)
+        self._sent   = 0
+        self._dropped = 0
+        self._errors = 0
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def send(self, frame_index, jpg_bytes):
+        try:
+            self._q.put_nowait((frame_index, jpg_bytes))
+        except queue.Full:
+            self._dropped += 1
+
+    def _worker(self):
+        import requests
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            frame_index, jpg_bytes = item
+            try:
+                requests.post(
+                    self._url,
+                    files={"file": (f"frame_{frame_index:06d}.jpg", jpg_bytes, "image/jpeg")},
+                    timeout=2,
+                )
+                self._sent += 1
+            except Exception:
+                self._errors += 1
+
+    def stop(self):
+        self._q.put(None)
+        self._thread.join(timeout=3)
+
+    def stats(self):
+        return {"sent": self._sent, "dropped": self._dropped, "errors": self._errors}
 
 
 def utc_now():
@@ -223,6 +267,129 @@ def pseudo_diagnostics(mb, lv, mf, verdict, reasons, bright_min, bright_max, lap
         "degradation_score":   score,
         "degradation_reasons": human_reasons,
         "threshold_profile":   profile,
+    }
+
+
+def compute_regions(gray, prev_gray, rows=3, cols=3):
+    h, w = gray.shape
+    rh, rw = h // rows, w // cols
+
+    darkest_mean         = float("inf")
+    brightest_mean       = float("-inf")
+    darkest_id           = 0
+    brightest_id         = 0
+    strongest_motion_id  = None
+    strongest_motion_val = -1.0
+
+    for r in range(rows):
+        for c in range(cols):
+            region_id = r * cols + c
+            y0 = r * rh
+            y1 = (r + 1) * rh if r < rows - 1 else h
+            x0 = c * rw
+            x1 = (c + 1) * rw if c < cols - 1 else w
+
+            cell      = gray[y0:y1, x0:x1]
+            cell_mean = float(cell.mean())
+
+            if cell_mean < darkest_mean:
+                darkest_mean = cell_mean
+                darkest_id   = region_id
+            if cell_mean > brightest_mean:
+                brightest_mean = cell_mean
+                brightest_id   = region_id
+
+            if prev_gray is not None:
+                diff    = cv2.absdiff(cell, prev_gray[y0:y1, x0:x1])
+                cell_mf = float(np.count_nonzero(diff > 20) / diff.size)
+                if cell_mf > strongest_motion_val:
+                    strongest_motion_val = cell_mf
+                    strongest_motion_id  = region_id
+
+    return {
+        "darkest_region":          {"region_id": darkest_id,  "mean": round(darkest_mean,  3)},
+        "brightest_region":        {"region_id": brightest_id, "mean": round(brightest_mean, 3)},
+        "strongest_motion_region": (
+            {"region_id": strongest_motion_id, "motion_fraction": round(strongest_motion_val, 6)}
+            if strongest_motion_id is not None else None
+        ),
+    }
+
+
+def compute_soso_delta(current_metrics, previous_metrics, current_frame_id, previous_frame_id=None):
+    if previous_metrics is None:
+        return {
+            "prev_frame":                      None,
+            "current_frame":                   current_frame_id,
+            "brightness_delta":                "0.000",
+            "motion_delta":                    "0.000000",
+            "darkest_region_changed":          False,
+            "brightest_region_changed":        False,
+            "strongest_motion_region_changed": False,
+            "region_change_count":             0,
+            "trend_state":                     "STABLE",
+            "delta_confidence":                "0.500",
+        }
+
+    brightness_delta = (
+        float(current_metrics["mean_brightness"])
+        - float(previous_metrics["mean_brightness"])
+    )
+    motion_delta = (
+        float(current_metrics["motion_fraction"])
+        - float(previous_metrics["motion_fraction"])
+    )
+
+    darkest_changed = (
+        current_metrics["darkest_region"]["region_id"]
+        != previous_metrics["darkest_region"]["region_id"]
+    )
+    brightest_changed = (
+        current_metrics["brightest_region"]["region_id"]
+        != previous_metrics["brightest_region"]["region_id"]
+    )
+
+    cur_mr  = current_metrics.get("strongest_motion_region")  or {}
+    prev_mr = previous_metrics.get("strongest_motion_region") or {}
+    strongest_motion_changed = (
+        cur_mr.get("region_id") != prev_mr.get("region_id")
+    )
+
+    region_change_count = sum([darkest_changed, brightest_changed, strongest_motion_changed])
+
+    light_shift  = brightness_delta >  8.0
+    dark_shift   = brightness_delta < -8.0
+    motion_shift = abs(motion_delta) > 0.02
+
+    triggers = sum([light_shift, dark_shift, motion_shift])
+    if triggers >= 2:
+        trend_state = "MIXED_SHIFT"
+    elif light_shift:
+        trend_state = "LIGHT_SHIFT"
+    elif dark_shift:
+        trend_state = "DARK_SHIFT"
+    elif motion_shift:
+        trend_state = "MOTION_SHIFT"
+    else:
+        trend_state = "STABLE"
+
+    delta_confidence = 0.5
+    if trend_state != "STABLE":
+        delta_confidence = 0.75
+    if region_change_count >= 2:
+        delta_confidence = min(0.95, delta_confidence + 0.15)
+
+    return {
+        "prev_frame":                      previous_frame_id,
+        "current_frame":                   current_frame_id,
+        "brightness_delta":                f"{brightness_delta:.3f}",
+        "motion_delta":                    f"{motion_delta:.6f}",
+        "darkest_region_changed":          darkest_changed,
+        "brightest_region_changed":        brightest_changed,
+        "strongest_motion_region_changed": strongest_motion_changed,
+        "region_change_count":             int(region_change_count),
+        "trend_state":                     trend_state,
+        "delta_confidence":                f"{delta_confidence:.3f}",
     }
 
 
@@ -805,10 +972,11 @@ def generate_postrun_report(run_dir, session_id, start_time, end_time,
             _pseudo_seq, _soso_seq = {}, {}
             _soso_class = {"state", "stability_band", "continuity_count", "advisory",
                            "continuity_window", "recent_instability_count", "recovery_count",
-                           "confidence_reason", "scene_drift_score", "authority"}
+                           "confidence_reason", "scene_drift_score", "authority", "soso_delta"}
             _pseudo_class = {"verdict", "reasons", "mean_brightness", "laplacian_var",
                              "motion_fraction", "motion_level", "brightness_level",
-                             "blur_level", "degradation_score", "degradation_reasons"}
+                             "blur_level", "degradation_score", "degradation_reasons",
+                             "darkest_region", "brightest_region", "strongest_motion_region"}
             for _p in _sep_pkts:
                 _pt  = _p.get("packet_type")
                 _fi  = _p.get("frame_index")
@@ -895,6 +1063,7 @@ def main():
     ap.add_argument("--postrun",      action="store_true", help="generate post-run report after session")
     ap.add_argument("--profile",      choices=["normal", "diagnostic", "stress", "audit"],
                     default="normal", help="capture profile: normal|diagnostic|stress|audit")
+    ap.add_argument("--hailo_node",   default="", help="AI node URL e.g. http://192.168.10.2:8000/process")
     args = ap.parse_args()
 
     # ── run directory — hot/ for live writes, post/ for post-processing ────────
@@ -958,7 +1127,9 @@ def main():
     confidence       = 0.5
     pass_count       = 0
     drop_count       = 0
-    prev_metrics     = None
+    prev_metrics        = None
+    prev_pseudo_metrics = None
+    prev_frame_id       = None
 
     baseline          = {"motion_avg": 0.01, "audio_rms_avg": 0.006, "brightness_avg": 100.0}
     _initial_baseline = None
@@ -970,6 +1141,7 @@ def main():
     cap_state         = CAPState()
     token_tracker     = VirtualTokenTracker()
     _soso_window      = collections.deque(maxlen=30)   # True=DROP, for recent_instability_count
+    hailo_sender      = HailoSender(args.hailo_node) if args.hailo_node else None
 
     # timing accumulators — per-stage, in milliseconds
     _tm_capture  = []
@@ -1016,10 +1188,20 @@ def main():
             pdiag  = pseudo_diagnostics(mb, lv, mf, verdict, reasons,
                                          args.bright_min, args.bright_max, args.lap_min, args.motion_max,
                                          args.profile)
+            # PSEUDO-lite measures current-frame regions; SoSo-lite reads them for delta.
+            _regions = compute_regions(gray, prev_gray)
+            _cur_pseudo_metrics = {
+                "mean_brightness": mb,
+                "motion_fraction": mf,
+                **_regions,
+            }
+            soso_delta = compute_soso_delta(
+                _cur_pseudo_metrics, prev_pseudo_metrics, frame_index, prev_frame_id
+            )
             pseudo = {"packet_type": "pseudo", "ts_utc": ts, "frame_index": frame_index,
                       "probe_id": args.probe_id, "mean_brightness": mb, "laplacian_var": lv,
                       "motion_fraction": mf, "verdict": verdict, "reasons": reasons,
-                      **pdiag}
+                      **pdiag, **_regions}
             obs    = {"packet_type": "observation", "ts_utc": ts, "frame_index": frame_index,
                       "probe_id": args.probe_id, "image_path": saved_path,
                       "image_sha256": saved_hash, "width": int(frame.shape[1]), "height": int(frame.shape[0])}
@@ -1083,7 +1265,8 @@ def main():
                     "continuity_window": len(_soso_window), "recent_instability_count": _recent_instability,
                     "recovery_count": recovery_count, "confidence": confidence,
                     "confidence_reason": conf_reason, "scene_drift_score": scene_drift,
-                    "advisory": advisory, "authority": "NONE"}
+                    "advisory": advisory, "authority": "NONE",
+                    "soso_delta": soso_delta}
             if llm_backend:
                 soso["llm_backend"] = llm_backend
             _t_build = time.perf_counter()
@@ -1092,6 +1275,11 @@ def main():
             writer.write(obs)
             writer.write(soso)
             _t_write = time.perf_counter()
+
+            # CRAM writes first — then async copy to AI node (never blocks)
+            if hailo_sender:
+                _, _jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                hailo_sender.send(frame_index, _jpg.tobytes())
 
             rms, peak, clipping = 0.0, 0.0, False
             if audio_cap:
@@ -1210,7 +1398,9 @@ def main():
             elif frame_index % 50 == 0:
                 print(f"f={frame_index:4d}  CAP:EVENT_BURST  [{strip}]  {traffic}  (quiet terminal)", flush=True)
 
-            prev_gray = gray
+            prev_gray           = gray
+            prev_pseudo_metrics = _cur_pseudo_metrics
+            prev_frame_id       = frame_index
             _t_loop_end = time.perf_counter()
             _ms = lambda a, b: round((b - a) * 1000, 2)
             _tm_capture.append(_ms(_t0, _t_capture))
@@ -1227,6 +1417,10 @@ def main():
         cap.release()
         if audio_cap:
             audio_cap.stop()
+        if hailo_sender:
+            hailo_sender.stop()
+            _hs = hailo_sender.stats()
+            print(f"Hailo sender: sent={_hs['sent']}  dropped={_hs['dropped']}  errors={_hs['errors']}")
 
         end_time = datetime.now(timezone.utc)
 

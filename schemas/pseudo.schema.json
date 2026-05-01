@@ -24,6 +24,35 @@
         "type": "string",
         "enum": ["brightness_low", "brightness_high", "blur_low_detail", "motion_high"]
       }
+    },
+    "darkest_region": {
+      "type": "object",
+      "required": ["region_id", "mean"],
+      "properties": {
+        "region_id": { "type": "integer", "minimum": 0 },
+        "mean":      { "type": "number", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "brightest_region": {
+      "type": "object",
+      "required": ["region_id", "mean"],
+      "properties": {
+        "region_id": { "type": "integer", "minimum": 0 },
+        "mean":      { "type": "number", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "strongest_motion_region": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["region_id", "motion_fraction"],
+          "properties": {
+            "region_id":      { "type": "integer", "minimum": 0 },
+            "motion_fraction":{ "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      ]
     }
   }
 }

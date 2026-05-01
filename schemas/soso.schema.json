@@ -17,6 +17,30 @@
     "continuity_count": { "type": "integer", "minimum": 0 },
     "confidence":       { "type": "number", "minimum": 0.0, "maximum": 1.0 },
     "advisory":         { "type": "string", "minLength": 1 },
-    "llm_backend":      { "type": "string" }
+    "llm_backend":      { "type": "string" },
+    "soso_delta": {
+      "type": "object",
+      "required": [
+        "prev_frame", "current_frame",
+        "brightness_delta", "motion_delta",
+        "darkest_region_changed", "brightest_region_changed", "strongest_motion_region_changed",
+        "region_change_count", "trend_state", "delta_confidence"
+      ],
+      "properties": {
+        "prev_frame":                      { "type": ["integer", "null"], "minimum": 1 },
+        "current_frame":                   { "type": "integer", "minimum": 1 },
+        "brightness_delta":                { "type": "string" },
+        "motion_delta":                    { "type": "string" },
+        "darkest_region_changed":          { "type": "boolean" },
+        "brightest_region_changed":        { "type": "boolean" },
+        "strongest_motion_region_changed": { "type": "boolean" },
+        "region_change_count":             { "type": "integer", "minimum": 0, "maximum": 3 },
+        "trend_state": {
+          "type": "string",
+          "enum": ["STABLE", "LIGHT_SHIFT", "DARK_SHIFT", "MOTION_SHIFT", "MIXED_SHIFT"]
+        },
+        "delta_confidence": { "type": "string" }
+      }
+    }
   }
 }
