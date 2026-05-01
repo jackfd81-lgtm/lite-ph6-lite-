@@ -23,6 +23,7 @@ from ph6lite.advisory_client import ask as llm_ask
 from virtual_tokens import VirtualTokenTracker
 from soso_swarm_lite import SoSoSwarmLite
 from postrun_soso_swarm_summary import run_soso_swarm_postrun, print_swarm_summary
+from pattern_scout import run_pattern_scout, print_scout_summary
 
 _SWARM_REASON_TO_EVENT = {
     "brightness_low":  "underlight",
@@ -528,13 +529,15 @@ def detect_spikes(frame_no, ts, metrics, baseline):
     rms        = metrics.get("audio_rms", 0.0)
     peak       = metrics.get("audio_peak", 0.0)
 
-    if brightness > 220:
+    # Adaptive brightness thresholds — floored so cold-start baseline doesn't false-fire
+    _bright_base = max(baseline.get("brightness_avg", 128.0), 120.0)
+    if brightness > _bright_base + 50:
         spikes.append("SPIKE_OVERLIGHT")
-    if brightness < 35:
+    if brightness < _bright_base - 60:
         spikes.append("SPIKE_UNDERLIGHT")
     if motion > max(0.15, baseline["motion_avg"] * 3):
         spikes.append("SPIKE_MOTION")
-    if rms > max(0.20, baseline["audio_rms_avg"] * 4) or peak > 0.95:
+    if rms > max(0.15, baseline["audio_rms_avg"] * 3) or peak > 0.95:
         spikes.append("SPIKE_SOUND")
     if blur < 80:
         spikes.append("SPIKE_BLUR")
@@ -581,7 +584,7 @@ def detect_presoak(frame_no, ts, metrics, prev_metrics, baseline):
 
     rms      = metrics.get("audio_rms", 0.0)
     prev_rms = prev_metrics.get("audio_rms", 0.0)
-    rms_thr  = max(0.20, baseline["audio_rms_avg"] * 4)
+    rms_thr  = max(0.15, baseline["audio_rms_avg"] * 3)
     if prev_rms > 0 and rms < rms_thr and rms > prev_rms * 1.75:
         warnings.append("PRE_SPIKE_SOUND")
 
@@ -1313,7 +1316,7 @@ def main():
 
     # ── camera ─────────────────────────────────────────────────────────────────
     is_url = isinstance(args.source, str) and args.source.startswith("http")
-    source = args.source if is_url else (args.camera if args.source == "0" else args.source)
+    source = args.source if is_url else (int(args.source) if args.source.isdigit() else args.source)
     cap    = cv2.VideoCapture(source, cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open source: {source}")
@@ -1844,6 +1847,12 @@ def main():
                 print(f"  Swarm:   {run_dir / 'post' / 'soso_swarm_summary.json'}")
             except Exception as _se:
                 print(f"  WARN: swarm summary failed: {_se}", flush=True)
+            try:
+                _, _scout_summary = run_pattern_scout(run_dir)
+                print_scout_summary(_scout_summary)
+                print(f"  Scout:   {run_dir / 'post' / 'pattern_records.jsonl'}")
+            except Exception as _pe:
+                print(f"  WARN: pattern scout failed: {_pe}", flush=True)
         except Exception as _e:
             _post_errors.append(f"report_gen: {_e}")
             print(f"  WARN: report generation failed: {_e}", flush=True)
