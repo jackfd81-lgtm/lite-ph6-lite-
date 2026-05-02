@@ -1,5 +1,5 @@
 """
-cram_writer.py — PH6/CRAM compliant write engine  (v0.3)
+cram_writer.py — PH6/CRAM compliant write engine  (v0.4)
 
 Authority note
 --------------
@@ -30,8 +30,12 @@ burst:
     throughput testing only. Not authoritative until CRAM commit completes.
 
 Full tmp→rename atomic segment commit (write(tmp)→fsync→rename→fsync(dir))
-is reserved for a future SegmentCRAMWriter and must not be inferred from any
-flag in this module.
+is implemented by SegmentCRAMWriter (also in this module).
+
+Classes
+-------
+CRAMWriter          — durable JSONL batching layer (v0.3 semantics)
+SegmentCRAMWriter   — full forensic segment atomicity (v0.4)
 """
 
 import os
@@ -304,3 +308,130 @@ def _validate_packet(packet):
             raise ValueError("virtual_token authority must be NONE")
         if packet["store"] != "MRAM-S":
             raise ValueError("virtual_token store must be MRAM-S")
+
+
+# ── segment writer ────────────────────────────────────────────────────────────
+
+class SegmentCRAMWriter:
+    """
+    Full Forensic Segment Mode write engine.  (v0.4)
+
+    Each segment is an independent JSONL file committed atomically:
+        write(tmp) → fsync(tmp) → rename(tmp → final) → fsync(dir)
+
+    A .tmp file left on disk indicates a crash mid-write and is not a
+    valid segment — readers must ignore or quarantine it.
+
+    Hash chain spans segments: the prev_hash of segment N's first packet
+    equals the packet_hash of segment N-1's last packet (genesis for seg 0).
+
+    Segment files: <log_dir>/seg_NNNNNN.jsonl  (six-digit zero-padded)
+
+    Parameters
+    ----------
+    log_dir      : directory where segment files land
+    segment_size : packets per segment before an atomic commit fires
+    buffer_size  : max packets in RAM before backpressure blocks the caller
+    """
+
+    def __init__(self, log_dir, segment_size=10, buffer_size=None):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.segment_size = max(1, segment_size)
+        self.buffer_size = max(self.segment_size, buffer_size or self.segment_size * 4)
+
+        self._buffer = collections.deque()
+        self._lock = threading.Lock()
+        self._packet_seq = 0
+        self._segment_id = 0
+        self._pending = 0
+        self._prev_hash = _GENESIS_HASH
+
+    # ── public ───────────────────────────────────────────────────────────────
+
+    def write(self, packet):
+        """
+        Annotate, hash-chain, stage, and commit when segment_size is reached.
+        Blocks if buffer is full (backpressure — never drops).
+        Returns the assigned packet_seq.
+        """
+        with self._lock:
+            self._packet_seq += 1
+            packet["packet_seq"] = self._packet_seq
+            _validate_packet(packet)
+
+            if "store" not in packet:
+                packet["store"] = "CRAM"
+                packet["durable"] = True
+
+            packet["prev_hash"] = self._prev_hash
+            canonical = json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            packet_hash = hashlib.blake2b(canonical.encode()).hexdigest()
+            packet["packet_hash"] = packet_hash
+            self._prev_hash = packet_hash
+
+            while len(self._buffer) >= self.buffer_size:
+                self._commit_locked()
+
+            self._buffer.append(
+                json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
+            )
+            self._pending += 1
+
+            if self._pending >= self.segment_size:
+                self._commit_locked()
+
+        return packet["packet_seq"]
+
+    def flush(self):
+        """Commit any buffered packets as a partial segment."""
+        with self._lock:
+            if self._pending:
+                self._commit_locked()
+
+    def close(self):
+        """Flush and finalize."""
+        self.flush()
+
+    @property
+    def packet_seq(self):
+        with self._lock:
+            return self._packet_seq
+
+    @property
+    def segment_id(self):
+        """Most recently committed segment number (0 = none committed yet)."""
+        with self._lock:
+            return self._segment_id
+
+    # ── internal ─────────────────────────────────────────────────────────────
+
+    def _seg_path(self, seg_id):
+        return self.log_dir / f"seg_{seg_id:06d}.jsonl"
+
+    def _commit_locked(self):
+        """
+        Drain buffer to a new segment via tmp→fsync→rename→fsync(dir).
+        Caller must hold self._lock.
+        """
+        if not self._buffer:
+            return
+
+        self._segment_id += 1
+        final = self._seg_path(self._segment_id)
+        tmp = final.with_suffix(".jsonl.tmp")
+
+        blob = ("\n".join(self._buffer) + "\n").encode("utf-8")
+        self._buffer.clear()
+        self._pending = 0
+
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, blob)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        os.rename(str(tmp), str(final))
+        _fsync_dir(self.log_dir)
