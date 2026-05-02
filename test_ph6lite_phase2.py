@@ -82,7 +82,10 @@ def _latest_run() -> Path:
     runs = sorted(HERE.glob("logs/run_*"))
     if not runs:
         sys.exit("ERROR: no logs/run_* directories found. Run --gen first.")
-    return runs[-1]
+    for d in reversed(runs):
+        if (d / "hot" / "run_log.jsonl").exists() or (d / "run_log.jsonl").exists():
+            return d
+    sys.exit("ERROR: no logs/run_* directory contains run_log.jsonl. Run --gen first.")
 
 
 def _load_packets(run_dir: Path) -> list:
