@@ -1,20 +1,37 @@
 """
-cram_writer.py — PH6/CRAM compliant write engine
+cram_writer.py — PH6/CRAM compliant write engine  (v0.3)
 
-RAM role: byte staging only (assembly + syscall reduction)
-CRAM role: truth, ordering, authority
+Authority note
+--------------
+This writer marks storage durability only (store, durable fields on packets).
+PH6 authority — PASS/DROP verdicts — belongs to PSEUDO. This writer does not
+decide it and must not be extended to do so.
 
-Write path:
+Write path (all modes):
     RAM (ring buffer, FIFO, no eviction) →
-    build tmp file →
-    write(tmp) → fsync(tmp) → rename(tmp → final) → fsync(dir)
+    [annotate store/durable] →
+    hash-chain →
+    stage in buffer →
+    flush to JSONL on threshold
 
-Invariants:
-    - no filtering
-    - no reordering
-    - no decision-making in RAM
-    - crash-safe: only unwritten bytes in buffer can be lost
-    - backpressure on full buffer (never drops)
+Mode semantics
+--------------
+balanced:
+    Batched JSONL append + fdatasync (fsync fallback). Default for Pi 5.
+
+forensic:
+    JSONL append + fsync + parent directory fsync, every packet.
+    This is Forensic JSONL Mode — it improves durability significantly
+    but is NOT full tmp→rename segment atomicity (Forensic Segment Mode).
+    A partial write at the final line is detectable as malformed JSON.
+
+burst:
+    Batched JSONL append with relaxed sync. Intended for scenario/lab
+    throughput testing only. Not authoritative until CRAM commit completes.
+
+Full tmp→rename atomic segment commit (write(tmp)→fsync→rename→fsync(dir))
+is reserved for a future SegmentCRAMWriter and must not be inferred from any
+flag in this module.
 """
 
 import os
@@ -26,6 +43,52 @@ from pathlib import Path
 
 _GENESIS_HASH = "0" * 128  # 64-byte blake2b = 128 hex chars
 
+# ── mode registry ─────────────────────────────────────────────────────────────
+
+CRAM_MODES = {
+    "forensic": {
+        "flush_every": 1,
+        "sync": "fsync",
+        "dir_sync": True,
+        "stage_store": "RAM_STAGE",
+        "commit_store": "CRAM",
+    },
+    "balanced": {
+        "flush_every": 10,
+        "sync": "fdatasync",
+        "dir_sync": False,
+        "stage_store": "RAM_STAGE",
+        "commit_store": "CRAM",
+    },
+    "burst": {
+        "flush_every": 50,
+        "sync": "none",
+        "dir_sync": False,
+        "stage_store": "RAM_STAGE",
+        "commit_store": "CRAM",
+    },
+}
+
+
+def sync_fd(fd: int, strategy: str) -> None:
+    """Sync an open file descriptor using the named strategy."""
+    if strategy == "none":
+        return
+    if strategy == "fdatasync" and hasattr(os, "fdatasync"):
+        os.fdatasync(fd)
+    else:
+        os.fsync(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+# ── writer ────────────────────────────────────────────────────────────────────
 
 class CRAMWriter:
     """
@@ -33,19 +96,31 @@ class CRAMWriter:
 
     Buffer is staging only — zero authority over what gets written.
     Backpressure blocks the caller rather than dropping packets.
-    Each flush is: write tmp → fsync tmp → rename → fsync dir.
+    The writer annotates each packet with store/durable before hashing;
+    it does not touch verdict fields or authority assignments.
+
+    Parameters
+    ----------
+    log_path     : final JSONL path
+    buffer_size  : max packets held in RAM before forced flush (backpressure)
+    flush_every  : override mode's default flush cadence (None = use mode)
+    mode         : "forensic" | "balanced" | "burst"  (default: "balanced")
     """
 
-    def __init__(self, log_path, buffer_size=64, flush_every=1):
-        """
-        log_path    — final JSONL path
-        buffer_size — max packets held in RAM before forced flush (backpressure)
-        flush_every — flush to disk after this many packets (1 = every packet)
-        """
+    def __init__(self, log_path, buffer_size=64, flush_every=None, mode="balanced"):
+        if mode not in CRAM_MODES:
+            raise ValueError(f"mode must be one of {list(CRAM_MODES)}, got {mode!r}")
+
+        cfg = CRAM_MODES[mode]
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.flush_every = max(1, flush_every)
+        self.mode = mode
+        self._sync_strategy = cfg["sync"]
+        self._dir_sync = cfg["dir_sync"]
+        self._commit_store = cfg["commit_store"]
+
+        self.flush_every = flush_every if flush_every is not None else cfg["flush_every"]
         self.buffer_size = max(self.flush_every, buffer_size)
 
         self._buffer = collections.deque()
@@ -59,13 +134,22 @@ class CRAMWriter:
 
     def write(self, packet):
         """
-        Assign packet_seq, stage in RAM, flush if threshold reached.
+        Validate, annotate, hash-chain, stage, and flush when threshold is met.
         Blocks if buffer is full (backpressure — never drops).
+        Returns the assigned packet_seq.
         """
         with self._lock:
             self._packet_seq += 1
             packet["packet_seq"] = self._packet_seq
             _validate_packet(packet)
+
+            # Storage durability annotation — writer's only authority is marking
+            # where data lives and whether it has been committed to durable storage.
+            # Packets with an existing store field (e.g. virtual_token: MRAM-S)
+            # are not overridden.
+            if "store" not in packet:
+                packet["store"] = self._commit_store
+                packet["durable"] = True
 
             # Hash chain: hash canonical JSON (with prev_hash, without packet_hash)
             packet["prev_hash"] = self._prev_hash
@@ -110,9 +194,8 @@ class CRAMWriter:
 
     def _flush_locked(self):
         """
-        Append buffered lines to the log file and fsync.
+        Append buffered lines, sync according to mode, optionally sync the dir.
         Caller must hold self._lock.
-        JSONL is append-only — no tmp/rename needed; each line is self-contained.
         """
         if not self._buffer:
             return
@@ -124,7 +207,11 @@ class CRAMWriter:
         blob = "\n".join(lines) + "\n"
         self._fh.write(blob)
         self._fh.flush()
-        os.fsync(self._fh.fileno())
+
+        sync_fd(self._fh.fileno(), self._sync_strategy)
+
+        if self._dir_sync:
+            _fsync_dir(self.log_path.parent)
 
 
 # ── packet validator ──────────────────────────────────────────────────────────
