@@ -11,3 +11,8 @@ build/
 *.log
 *.jsonl
 *.tar.gz
+
+# Generated PH6 reports
+ph6lite_coherence_report.json
+__pycache__/
+*.pyc
