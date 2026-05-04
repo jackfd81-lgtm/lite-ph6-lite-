@@ -259,6 +259,56 @@ def test_token_leakage():
                 f"close_all: packet {pkt.get('token_id')!r} store not MRAM-S"
             )
 
+    # ── test 7: closed token packets precede session_end in CRAM log ─────────
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = os.path.join(tmpdir, "order_test.jsonl")
+        cram = CRAMWriter(log_path)
+
+        tracker3 = VirtualTokenTracker()
+        for pkt in tracker3.observe_event(1, "motion", TS):
+            pkt["source"] = "SoSo.VirtualTokenTracker"
+            cram.write(pkt)
+        for pkt in tracker3.observe_event(5, "overlight", TS):
+            pkt["source"] = "SoSo.VirtualTokenTracker"
+            cram.write(pkt)
+
+        if not tracker3.active:
+            failures.append("order test: no active tokens before close_all — setup error")
+
+        for pkt in tracker3.close_all(30, TS):
+            pkt["source"] = "SoSo.VirtualTokenTracker"
+            cram.write(pkt)
+        cram.write({
+            "packet_type": "session_end", "ts_utc": TS,
+            "session_id": "order-test", "frames_processed": 30,
+            "message": "session ended",
+        })
+        cram.close()
+
+        with open(log_path) as _f:
+            _log_pkts = [json.loads(l) for l in _f if l.strip()]
+
+        _types = [p["packet_type"] for p in _log_pkts]
+        _end_pos = next((i for i, t in enumerate(_types) if t == "session_end"), None)
+
+        if _end_pos is None:
+            failures.append("order test: session_end packet missing from log")
+        else:
+            _closed_pos = [
+                i for i, p in enumerate(_log_pkts)
+                if p.get("packet_type") == "virtual_token"
+                and p.get("state") == "closed"
+            ]
+            if not _closed_pos:
+                failures.append("order test: no closed token packets in log")
+            else:
+                _after = [i for i in _closed_pos if i > _end_pos]
+                if _after:
+                    failures.append(
+                        f"order test: {len(_after)} closed token packet(s) appear "
+                        f"after session_end (indices {_after}, session_end at {_end_pos})"
+                    )
+
     # ── report ────────────────────────────────────────────────────────────────
     print(f"\n── Virtual Token Leakage Test ──────────────────────────────────")
     print(f"  frames        : {len(frames)}")
