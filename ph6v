@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+cd "$HOME/frame_filter" || exit 1
+exec ./ph6_lite_validate.sh "$@"
