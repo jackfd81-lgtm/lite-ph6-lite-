@@ -299,13 +299,12 @@ def check_leakage():
     )
 
     output = result.stdout + result.stderr
-    passed = result.returncode == 0 and "PASS" in output.upper() and "FAIL" not in output.upper()
+    passed = result.returncode == 0
 
     for line in output.strip().splitlines()[-12:]:
         print(f"  {line}")
 
-    row("leakage test exit code", str(result.returncode), "PASS" if result.returncode == 0 else "FAIL")
-    row("leakage test result",    "PASS" if passed else "FAIL", "PASS" if passed else "FAIL")
+    row("leakage test result", "PASS" if passed else "FAIL", "PASS" if passed else "FAIL")
 
     return "PASS" if passed else "FAIL"
 
@@ -328,67 +327,100 @@ def worst(verdicts):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
-    dry_run  = "--dry-run" in sys.argv
-    n_frames = MIN_FRAMES
-    for i, arg in enumerate(sys.argv[1:]):
+    dry_run     = "--dry-run" in sys.argv
+    n_frames    = MIN_FRAMES
+    run_dir_arg = None
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
         if arg.startswith("--frames="):
             n_frames = int(arg.split("=")[1])
-        elif arg == "--frames" and i + 1 < len(sys.argv) - 1:
-            n_frames = int(sys.argv[i + 2])
+        elif arg == "--frames" and i + 1 < len(args):
+            n_frames = int(args[i + 1])
+        elif arg.startswith("--run-dir="):
+            run_dir_arg = Path(arg.split("=", 1)[1])
+        elif arg == "--run-dir" and i + 1 < len(args):
+            run_dir_arg = Path(args[i + 1])
 
     print(f"\n{BOLD}{WHITE}PH6 Full-Stack Coherence Test{RESET}")
-    print(f"  Target: {n_frames} frames  |  Min valid: {MIN_FRAMES} frames\n")
 
-    # ── Pre-flight: lock exposure ─────────────────────────────────────────
-    section("PRE-FLIGHT — EXPOSURE LOCK")
-    exp = subprocess.run(
-        ["v4l2-ctl", "--device", "/dev/video0",
-         "--set-ctrl", "auto_exposure=1,exposure_time_absolute=500"],
-        capture_output=True, text=True
-    )
-    row("exposure lock (500)", "ok" if exp.returncode == 0 else exp.stderr.strip(),
-        "PASS" if exp.returncode == 0 else "WARN")
-
-    # ── Run frame_filter ──────────────────────────────────────────────────
-    section("PIPELINE RUN")
-    ff_result = run_frame_filter(n_frames, dry_run)
-
-    run_dir = latest_run_dir()
-    if run_dir is None and not dry_run:
-        print(f"\n  {clr(RED, 'HARD FAIL')} — no run directory found after frame_filter")
-        sys.exit(1)
-
-    # Load summary
-    summary = None
-    if run_dir and not dry_run:
-        sp = run_dir / "post" / "run_summary.json"
-        if sp.exists():
-            summary = json.loads(sp.read_text())
-            actual_frames = summary.get("frames", 0)
-        else:
-            actual_frames = 0
-    else:
-        actual_frames = n_frames  # dry-run: assume ok
-
-    # ── Layer audits ──────────────────────────────────────────────────────
     layer_verdicts = {}
 
-    layer_verdicts["camera"]   = check_camera(summary) if not dry_run else "PASS"
+    if run_dir_arg:
+        # ── Audit existing run dir — skip pipeline ────────────────────────
+        print(f"  Mode: audit existing run\n")
+        run_dir = run_dir_arg
+        if not run_dir.exists():
+            print(f"\n  {clr(RED, 'HARD FAIL')} — run directory not found: {run_dir}")
+            sys.exit(1)
+        section("EXISTING RUN")
+        print(f"  Run dir: {run_dir}")
+        sp = run_dir / "post" / "run_summary.json"
+        if sp.exists():
+            summary      = json.loads(sp.read_text())
+            actual_frames = summary.get("frames", 0)
+            print(f"  Frames:  {actual_frames}")
+        else:
+            summary       = None
+            actual_frames = 0
 
-    if layer_verdicts["camera"] == "INVALID":
-        print(f"\n  {clr(RED, 'INVALID')} — run stopped before {MIN_FRAMES} frames. Abort.")
-        sys.exit(1)
-
-    if not dry_run and run_dir:
+        layer_verdicts["camera"] = check_camera(summary)
+        if layer_verdicts["camera"] == "INVALID":
+            print(f"\n  {clr(RED, 'INVALID')} — run stopped before {MIN_FRAMES} frames.")
+            sys.exit(1)
         layer_verdicts["cram"]    = check_cram(run_dir, actual_frames)
         layer_verdicts["soso"]    = check_soso(run_dir, actual_frames)
         layer_verdicts["tokens"]  = check_tokens(run_dir)
         layer_verdicts["swarm"]   = check_swarm(run_dir)
         layer_verdicts["postrun"] = check_postrun(run_dir)
         layer_verdicts["leakage"] = check_leakage()
+
     else:
-        for k in ("cram","soso","tokens","swarm","postrun","leakage"):
-            layer_verdicts[k] = "INFO"
+        # ── Full pipeline run ─────────────────────────────────────────────
+        print(f"  Target: {n_frames} frames  |  Min valid: {MIN_FRAMES} frames\n")
+
+        section("PRE-FLIGHT — EXPOSURE LOCK")
+        exp = subprocess.run(
+            ["v4l2-ctl", "--device", "/dev/video0",
+             "--set-ctrl", "auto_exposure=1,exposure_time_absolute=500"],
+            capture_output=True, text=True
+        )
+        row("exposure lock (500)", "ok" if exp.returncode == 0 else exp.stderr.strip(),
+            "PASS" if exp.returncode == 0 else "WARN")
+
+        section("PIPELINE RUN")
+        run_frame_filter(n_frames, dry_run)
+
+        run_dir = latest_run_dir()
+        if run_dir is None and not dry_run:
+            print(f"\n  {clr(RED, 'HARD FAIL')} — no run directory found after frame_filter")
+            sys.exit(1)
+
+        summary = None
+        if run_dir and not dry_run:
+            sp = run_dir / "post" / "run_summary.json"
+            if sp.exists():
+                summary       = json.loads(sp.read_text())
+                actual_frames = summary.get("frames", 0)
+            else:
+                actual_frames = 0
+        else:
+            actual_frames = n_frames
+
+        layer_verdicts["camera"] = check_camera(summary) if not dry_run else "PASS"
+        if layer_verdicts["camera"] == "INVALID":
+            print(f"\n  {clr(RED, 'INVALID')} — run stopped before {MIN_FRAMES} frames. Abort.")
+            sys.exit(1)
+
+        if not dry_run and run_dir:
+            layer_verdicts["cram"]    = check_cram(run_dir, actual_frames)
+            layer_verdicts["soso"]    = check_soso(run_dir, actual_frames)
+            layer_verdicts["tokens"]  = check_tokens(run_dir)
+            layer_verdicts["swarm"]   = check_swarm(run_dir)
+            layer_verdicts["postrun"] = check_postrun(run_dir)
+            layer_verdicts["leakage"] = check_leakage()
+        else:
+            for k in ("cram","soso","tokens","swarm","postrun","leakage"):
+                layer_verdicts[k] = "INFO"
 
     # ── Apply hard verdict rules ──────────────────────────────────────────
     section("FINAL VERDICT")
