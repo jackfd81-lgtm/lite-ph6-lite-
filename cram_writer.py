@@ -300,6 +300,11 @@ def _validate_packet(packet):
             if k not in packet:
                 raise ValueError(f"session_end missing {k}")
 
+    if ptype == "cap_mode_transition":
+        for k in ("frame_index", "from_mode", "to_mode", "trigger"):
+            if k not in packet:
+                raise ValueError(f"cap_mode_transition missing {k}")
+
     if ptype == "virtual_token":
         for k in ("frame_index", "token_type", "token_id", "authority", "store"):
             if k not in packet:
