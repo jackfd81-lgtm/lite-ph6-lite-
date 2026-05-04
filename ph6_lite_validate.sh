@@ -56,6 +56,14 @@ else
     fi
 fi
 
+# ── token leakage + ordering invariant test ───────────────────────────────────
+log "Running token leakage test (7 assertions)"
+if python3 test_token_leakage.py > "$OUT/token_leakage.stdout" 2>"$OUT/token_leakage.stderr"; then
+    log "Token leakage PASS"
+else
+    log "Token leakage FAIL"; fail
+fi
+
 # ── oracle known-answer test ──────────────────────────────────────────────────
 log "Running oracle known-answer test"
 if python3 ph6_synthetic_oracle_300.py > "$OUT/oracle_300.stdout" 2>"$OUT/oracle_300.stderr"; then
