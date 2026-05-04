@@ -38,6 +38,190 @@ _SWARM_REASON_TO_EVENT = {
 # KeyboardInterrupt, or a fatal runtime error unrelated to frame content.
 # Never break, return, or raise out of the capture loop because of verdict == DROP or motion_high.
 
+class SyntheticCapture:
+    """Camera-independent synthetic frame source for pipeline testing.
+
+    Generates 640×480 (or configured) BGR frames at the requested fps.
+    Injects a moving circle + periodic brightness spikes so that
+    PSEUDO/SoSo/token/swarm layers all see realistic signal variation.
+    """
+
+    def __init__(self, width=640, height=480, fps=18):
+        self._w   = int(width)
+        self._h   = int(height)
+        self._fps = float(fps)
+        self._rng = np.random.default_rng(42)
+        self._n   = 0
+        self._interval  = 1.0 / self._fps
+        self._next_tick = time.perf_counter()
+
+    def isOpened(self):  return True
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:   self._w = int(value)
+        elif prop == cv2.CAP_PROP_FRAME_HEIGHT: self._h = int(value)
+        elif prop == cv2.CAP_PROP_FPS:
+            self._fps = float(value)
+            self._interval = 1.0 / self._fps
+        return True
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:  return float(self._w)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT: return float(self._h)
+        if prop == cv2.CAP_PROP_FPS:          return float(self._fps)
+        return 0.0
+
+    def read(self):
+        # pace to requested fps
+        wait = self._next_tick - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+        self._next_tick = time.perf_counter() + self._interval
+
+        n = self._n
+        self._n += 1
+
+        # base brightness: ~100 (above bright_min=40, below bright_max=220)
+        base = 100
+        if n % 150 in range(0, 4):
+            base = 238   # brief overlight spike → SPIKE_OVERLIGHT
+        elif n % 120 in range(60, 63):
+            base = 12    # brief underlight → SPIKE_UNDERLIGHT
+
+        frame = np.full((self._h, self._w, 3), base, dtype=np.uint8)
+        noise = self._rng.integers(-20, 21, (self._h, self._w, 3), dtype=np.int16)
+        frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        # moving circle → inter-frame motion → SPIKE_MOTION during active frames
+        cx = int(self._w * 0.5 + self._w * 0.3 * np.sin(n * 0.25))
+        cy = int(self._h * 0.5)
+        cv2.circle(frame, (cx, cy), 45, (int(base * 1.8), int(base * 1.8), int(base * 1.8)), -1)
+
+        return True, frame
+
+    def release(self):
+        pass
+
+
+class OracleSyntheticCapture:
+    """Deterministic oracle source for known-answer PH6 testing.
+
+    Produces precisely controlled frames across 8 windows:
+      1– 60   quiet stable         → PASS expected, no spikes
+      61– 90  pre-motion           → rising motion, approaching threshold
+      91–120  strong motion        → motion_fraction ~0.50 → SPIKE_MOTION + DROP
+     121–150  overlight            → brightness 235 → SPIKE_OVERLIGHT + DROP
+     151–180  sustained overlight  → continued SPIKE_OVERLIGHT, possible VLT
+     181–210  blur / degraded      → laplacian ~0 → SPIKE_BLUR + DROP
+     211–240  recovery             → PASS recovering
+     241–300  quiet stable         → PASS stable, token decay
+    """
+
+    WINDOWS = [
+        (1,   60,  "quiet"),
+        (61,  90,  "pre_motion"),
+        (91,  120, "strong_motion"),
+        (121, 150, "overlight"),
+        (151, 180, "sustained_overlight"),
+        (181, 210, "blur"),
+        (211, 240, "recovery"),
+        (241, 300, "quiet"),
+    ]
+
+    def __init__(self, width=640, height=480, fps=18):
+        self._w        = int(width)
+        self._h        = int(height)
+        self._fps      = float(fps)
+        self._n        = 0
+        self._interval = 1.0 / self._fps
+        self._next_tick = time.perf_counter()
+
+        H, W = self._h, self._w
+        rng  = np.random.default_rng(42)
+
+        # ── base: sharp noise → lap_var >> 80, motion=0 (same every call) ───
+        noise = rng.integers(-40, 41, (H, W, 3), dtype=np.int16)
+        self._quiet = np.clip(100 + noise, 0, 255).astype(np.uint8)
+
+        # ── strong motion: alternating halves shift ±70 ──────────────────────
+        # Frame A: top half +70, bottom half –70 relative to quiet
+        self._motion_a = self._quiet.copy()
+        self._motion_a[:H//2, :] = np.clip(
+            self._quiet[:H//2, :].astype(np.int16) + 70, 0, 255).astype(np.uint8)
+        self._motion_a[H//2:, :] = np.clip(
+            self._quiet[H//2:, :].astype(np.int16) - 70, 0, 255).astype(np.uint8)
+        # Frame B: inverse — top –70, bottom +70
+        self._motion_b = self._quiet.copy()
+        self._motion_b[:H//2, :] = np.clip(
+            self._quiet[:H//2, :].astype(np.int16) - 70, 0, 255).astype(np.uint8)
+        self._motion_b[H//2:, :] = np.clip(
+            self._quiet[H//2:, :].astype(np.int16) + 70, 0, 255).astype(np.uint8)
+        # diff at ALL pixels > 70 > threshold=20 → motion_fraction ≈ 1.0
+
+        # ── pre-motion: only left 8% of columns change (+40) ─────────────────
+        col = max(1, W * 8 // 100)
+        rng2 = np.random.default_rng(43)
+        self._pre_b = self._quiet.copy()
+        self._pre_b[:, :col] = np.clip(
+            100 + rng2.integers(-40, 41, (H, col, 3), dtype=np.int16), 0, 255
+        ).astype(np.uint8)
+        # diff in left 8% columns: |quiet[:,col] - pre_b[:,col]| ≈ random
+        # fraction with diff > 20: ~50% of 8% cols = ~4% of total pixels
+
+        # ── overlight: brightness 235, sharp texture ──────────────────────────
+        rnoise = rng.integers(-10, 11, (H, W, 3), dtype=np.int16)
+        self._overlight = np.clip(235 + rnoise, 220, 255).astype(np.uint8)
+
+        # ── blur: perfectly uniform → laplacian_var ≈ 0 ─────────────────────
+        self._blur = np.full((H, W, 3), 100, dtype=np.uint8)
+
+    def _mode(self, n):
+        for start, end, mode in self.WINDOWS:
+            if start <= n <= end:
+                return mode
+        return "quiet"
+
+    def isOpened(self): return True
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:   self._w = int(value)
+        elif prop == cv2.CAP_PROP_FRAME_HEIGHT: self._h = int(value)
+        elif prop == cv2.CAP_PROP_FPS:
+            self._fps = float(value)
+            self._interval = 1.0 / self._fps
+        return True
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:  return float(self._w)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT: return float(self._h)
+        if prop == cv2.CAP_PROP_FPS:          return float(self._fps)
+        return 0.0
+
+    def read(self):
+        wait = self._next_tick - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+        self._next_tick = time.perf_counter() + self._interval
+
+        self._n += 1
+        n    = self._n
+        mode = self._mode(n)
+
+        if mode in ("quiet", "recovery"):
+            return True, self._quiet.copy()
+        if mode == "pre_motion":
+            return True, (self._quiet if n % 2 == 0 else self._pre_b).copy()
+        if mode == "strong_motion":
+            return True, (self._motion_a if n % 2 == 0 else self._motion_b).copy()
+        if mode in ("overlight", "sustained_overlight"):
+            return True, self._overlight.copy()
+        if mode == "blur":
+            return True, self._blur.copy()
+        return True, self._quiet.copy()
+
+    def release(self): pass
+
+
 class AudioCapture:
     """Captures audio from mic via arecord in a background thread."""
 
@@ -1314,15 +1498,25 @@ def main():
     spike_log_path = Path(args.spike_log) if args.spike_log else hot_dir / "spike_events.jsonl"
     frames_dir     = args.frames_dir      if args.frames_dir else str(hot_dir / "frames")
 
-    # ── camera ─────────────────────────────────────────────────────────────────
-    is_url = isinstance(args.source, str) and args.source.startswith("http")
-    source = args.source if is_url else (int(args.source) if args.source.isdigit() else args.source)
-    cap    = cv2.VideoCapture(source, cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open source: {source}")
-    if args.width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-    if args.height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if args.fps:    cap.set(cv2.CAP_PROP_FPS,          args.fps)
+    # ── camera / synthetic / oracle source ─────────────────────────────────────
+    _src_lc = isinstance(args.source, str) and args.source.lower()
+    is_synthetic = _src_lc == "synthetic"
+    is_oracle    = _src_lc == "oracle"
+    if is_synthetic:
+        cap    = SyntheticCapture(width=args.width or 640, height=args.height or 480, fps=args.fps or 18)
+        source = "synthetic"
+    elif is_oracle:
+        cap    = OracleSyntheticCapture(width=args.width or 640, height=args.height or 480, fps=args.fps or 18)
+        source = "oracle"
+    else:
+        is_url = isinstance(args.source, str) and args.source.startswith("http")
+        source = args.source if is_url else (int(args.source) if args.source.isdigit() else args.source)
+        cap    = cv2.VideoCapture(source, cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(source)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open source: {source}")
+        if args.width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+        if args.height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        if args.fps:    cap.set(cv2.CAP_PROP_FPS,          args.fps)
 
     cap_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  or 640
     cap_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
