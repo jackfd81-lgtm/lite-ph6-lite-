@@ -1934,6 +1934,10 @@ def main():
                       "baseline_motion": round(baseline["motion_avg"], 4),
                       "baseline_audio_rms": round(baseline["audio_rms_avg"], 4)})
 
+        for _tp in token_tracker.close_all(frame_index, utc_now()):
+            _tp["source"] = "SoSo.VirtualTokenTracker"
+            writer.write(_tp)
+
         writer.write({"packet_type": "session_end", "ts_utc": utc_now(),
                       "session_id": session_id, "frames_processed": frame_index,
                       "message": "session ended"})

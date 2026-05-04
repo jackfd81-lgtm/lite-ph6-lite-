@@ -106,6 +106,14 @@ class VirtualTokenTracker:
                 del self.active[token_id]
         return packets
 
+    def close_all(self, frame_index: int, ts: str) -> List[dict]:
+        packets = []
+        for token_id, token in list(self.active.items()):
+            token.state = "closed"
+            packets.append(token.to_packet(frame_index, ts))
+            del self.active[token_id]
+        return packets
+
     def _find_active(self, event_kind: str, frame_index: int) -> Optional[VirtualToken]:
         candidates = [
             t for t in self.active.values()

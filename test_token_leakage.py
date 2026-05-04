@@ -232,6 +232,33 @@ def test_token_leakage():
 
         cram.close()
 
+    # ── test 6: close_all() emits closed packets; boundaries hold ────────────
+    tracker2 = VirtualTokenTracker()
+    tracker2.observe_event(1, "motion", TS)
+    tracker2.observe_event(2, "blur", TS)
+    if not tracker2.active:
+        failures.append("close_all test: expected active tokens before close_all")
+    closed_pkts = tracker2.close_all(50, TS)
+    if tracker2.active:
+        failures.append("close_all test: active tokens remain after close_all")
+    if len(closed_pkts) != 2:
+        failures.append(
+            f"close_all test: expected 2 closed packets, got {len(closed_pkts)}"
+        )
+    for pkt in closed_pkts:
+        if pkt.get("state") != "closed":
+            failures.append(
+                f"close_all: packet {pkt.get('token_id')!r} state={pkt.get('state')!r}"
+            )
+        if pkt.get("authority") != "NONE":
+            failures.append(
+                f"close_all: packet {pkt.get('token_id')!r} authority not NONE"
+            )
+        if pkt.get("store") != "MRAM-S":
+            failures.append(
+                f"close_all: packet {pkt.get('token_id')!r} store not MRAM-S"
+            )
+
     # ── report ────────────────────────────────────────────────────────────────
     print(f"\n── Virtual Token Leakage Test ──────────────────────────────────")
     print(f"  frames        : {len(frames)}")
