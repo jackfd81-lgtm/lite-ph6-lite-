@@ -99,7 +99,7 @@ python3 - <<PYEOF > "$OUT/validation_receipt.json"
 import json, datetime
 print(json.dumps({
     "schema": "ph6.lite.validation.receipt.v1",
-    "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "validation_dir": "$OUT",
     "latest_run": "$LATEST_RUN",
     "required_min_frames": 300,
