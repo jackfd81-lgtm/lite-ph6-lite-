@@ -1,0 +1,41 @@
+{
+  "authority": "NONE",
+  "authority_effect_check": {
+    "boundary_errors": [],
+    "checked_fields": [
+      "authority == NONE",
+      "store == MRAM-S",
+      "lane == LANE_2",
+      "advisory_only == true",
+      "may_influence_verdict == false",
+      "no verdict field present",
+      "token_type in RT/VDT/VLT"
+    ],
+    "confirmation": "Token subsystem had no authority effect",
+    "passed": true
+  },
+  "longest_advisory_continuity_chain": {
+    "event_type": "overlight",
+    "length": 62,
+    "terminal_token_id": "VDT_789b727d094e",
+    "terminal_token_type": "VDT"
+  },
+  "may_influence_pass_drop": false,
+  "may_influence_pseudo": false,
+  "may_write_cram": false,
+  "replay_dependency": false,
+  "schema": "ph6.postrun.soso_swarm_summary.v0.1",
+  "source": "MRAM-S",
+  "store": "POSTRUN_REPORT",
+  "strongest_event_type": {
+    "event_type": "overlight",
+    "strength_sum": 1951,
+    "token_count": 62
+  },
+  "token_counts": {
+    "RT": 4,
+    "VDT": 119,
+    "VLT": 4
+  },
+  "total_tokens": 127
+}

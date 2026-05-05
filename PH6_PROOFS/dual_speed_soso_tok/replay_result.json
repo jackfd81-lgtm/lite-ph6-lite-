@@ -1,0 +1,31 @@
+{
+  "tool": "replay_cram.py",
+  "run_dir": "logs/run_20260505_143008",
+  "verdict": "PASS",
+  "frames_audited": 300,
+  "checks": {
+    "total_packets": 1565,
+    "pseudo_packets": 300,
+    "observation_packets": 300,
+    "soso_packets": 300,
+    "triplet_aligned": true,
+    "min_frames_met": true,
+    "soso_authority_NONE": "300/300",
+    "soso_no_verdict": true,
+    "soso_may_influence": 0,
+    "pseudo_authority_clean": true,
+    "hash_chain_broken_links": 0,
+    "swarm_authority": "NONE",
+    "authority_effect_passed": true,
+    "may_influence_pass_drop": false,
+    "may_influence_pseudo": false,
+    "may_write_cram": false,
+    "postrun_files_present": [
+      "run_summary.json",
+      "postrun_report.md",
+      "soso_swarm_summary.json",
+      "pattern_records.jsonl",
+      "spike_events.jsonl"
+    ]
+  }
+}

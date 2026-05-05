@@ -1,0 +1,30 @@
+{
+  "session_id": "39d8330168f9047c",
+  "start_time": "2026-05-05T14:30:08.240074+00:00",
+  "end_time": "2026-05-05T14:35:13.522053+00:00",
+  "duration_s": 305.3,
+  "frames": 300,
+  "fps": 1.0,
+  "pass_count": 179,
+  "drop_count": 121,
+  "spike_total": 100,
+  "spike_type_counts": {
+    "SPIKE_MOTION": 21,
+    "SPIKE_OVERLIGHT": 50,
+    "SPIKE_UNDERLIGHT": 23,
+    "SPIKE_BLUR": 30,
+    "SPIKE_COMBINED": 23
+  },
+  "severity_counts": {
+    "MEDIUM": 42,
+    "LOW": 57,
+    "HIGH": 1
+  },
+  "event_clusters": 1,
+  "scene_labels": [
+    "well-lit environment",
+    "movement detected \u2014 possible person or object activity",
+    "quiet acoustic environment",
+    "camera stability concern (blur events detected)"
+  ]
+}

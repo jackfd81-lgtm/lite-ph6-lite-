@@ -1,0 +1,39 @@
+{
+  "proof": "dual_speed_soso_tok_stress",
+  "date": "2026-05-05",
+  "run_dir": "logs/run_20260505_143008",
+  "session_id": "39d8330168f9047c",
+  "source": "oracle",
+  "frames": 300,
+  "slow_path_delay_ms": 500,
+  "tok_slow_delay_ms": 500,
+  "final_verdict": "PASS",
+  "packet_counts": {
+    "pseudo": 300,
+    "observation": 300,
+    "soso": 300,
+    "soso_slow": 300,
+    "virtual_token": 257,
+    "spike_event": 100
+  },
+  "authority_checks": {
+    "blocked_by_lane2": false,
+    "may_write_cram": false,
+    "may_influence_pass_drop": false,
+    "replay_dependency": false,
+    "authority_boundary_errors": []
+  },
+  "run_summary": {
+    "duration_s": 305.3,
+    "fps": 1.0,
+    "pass_count": 179,
+    "drop_count": 121,
+    "spike_total": 100
+  },
+  "doctrine": {
+    "CRAM_PSEUDO": "hard real-time authority path",
+    "SoSo_FAST_TOK_FAST": "immediate advisory shadow path",
+    "SoSo_SLOW_TOK_SLOW": "delayed cognition path",
+    "rule": "FAST may observe now. SLOW may understand later. Neither may decide truth."
+  }
+}

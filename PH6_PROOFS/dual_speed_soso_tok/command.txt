@@ -1,0 +1,10 @@
+python3 ph6_full_stack_coherence.py \
+  --source oracle \
+  --frames 300 \
+  --dual-speed-soso \
+  --soso-fast \
+  --tok-fast \
+  --soso-slow-delay-ms 500 \
+  --tok-slow-delay-ms 500 \
+  --allow-lane2-backlog \
+  --run-replay

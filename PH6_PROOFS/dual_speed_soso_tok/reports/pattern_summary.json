@@ -1,0 +1,21 @@
+{
+  "schema": "ph6.pattern_scout.v0.1",
+  "authority": "NONE",
+  "store": "MRAM-S",
+  "phase_signatures": {
+    "unphased": "NO_EXPECTATION"
+  },
+  "misclassifications": [],
+  "cascade_patterns": 10,
+  "repeating_patterns": 5,
+  "longest_token_chain": {
+    "event_type": "motion",
+    "length_frames": 120,
+    "chain": [
+      "RT",
+      "VDT",
+      "VLT"
+    ]
+  },
+  "authority_effect": "NONE"
+}
