@@ -1469,6 +1469,12 @@ def main():
                     help="path to status.json for display loop")
     ap.add_argument("--phases",       default="",
                     help="phase labels: 'quiet:0-300,camera:301-600,music:601-900'")
+    ap.add_argument("--dual-speed-soso",    action="store_true",
+                    help="enable dual-speed SoSo/TOK: fast advisory + delayed slow advisory")
+    ap.add_argument("--soso-slow-delay-ms", type=int, default=0,
+                    help="SoSo-SLOW: delay (ms) after CRAM write before writing soso_slow packet")
+    ap.add_argument("--tok-slow-delay-ms",  type=int, default=0,
+                    help="TOK-SLOW: delay (ms) after fast token writes (continuity pressure test)")
     args = ap.parse_args()
 
     # ── phase map ─────────────────────────────────────────────────────────────
@@ -1709,12 +1715,26 @@ def main():
             soso["phase"] = _frame_phase
             if llm_backend:
                 soso["llm_backend"] = llm_backend
+            if args.dual_speed_soso:
+                soso["advisory_tier"] = "FAST"
             _t_build = time.perf_counter()
 
+            # SoSo-FAST + PSEUDO write to CRAM immediately — Lane-1 authority path
             writer.write(pseudo)
             writer.write(obs)
             writer.write(soso)
             _t_write = time.perf_counter()
+
+            # SoSo-SLOW: deeper advisory after delay — AFTER CRAM write, advisory_tier=SLOW, authority=NONE
+            if args.soso_slow_delay_ms > 0:
+                time.sleep(args.soso_slow_delay_ms / 1000.0)
+            if args.dual_speed_soso:
+                soso_slow = {**soso,
+                             "packet_type":   "soso_slow",
+                             "advisory_tier": "SLOW",
+                             "ts_utc":        utc_now(),
+                             "authority":     "NONE"}
+                writer.write(soso_slow)
 
             # CRAM writes first — then async copy to AI node (never blocks)
             if hailo_sender and frame_index % HAILO_SEND_EVERY_N == 0:
@@ -1817,6 +1837,9 @@ def main():
                 _tp["source"] = "SoSo.VirtualTokenTracker"
                 _tp["phase"]  = _frame_phase
                 writer.write(_tp)
+            # TOK-SLOW: delayed continuity processing after fast token writes
+            if args.tok_slow_delay_ms > 0:
+                time.sleep(args.tok_slow_delay_ms / 1000.0)
 
             # SoSo Swarm Lite — advisory pattern tracking, MRAM-S only, LANE_2
             # PSEUDO verdict already locked above; swarm observes but never decides

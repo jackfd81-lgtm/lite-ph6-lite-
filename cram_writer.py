@@ -228,16 +228,16 @@ def _validate_packet(packet):
             raise ValueError(f"missing {field}")
 
     ptype = packet["packet_type"]
-    allowed = {"session_start", "config", "pseudo", "observation", "soso", "audio",
-               "spike_event", "warning_event", "scene_observation_advisory", "session_end",
-               "cap_mode_transition", "virtual_token"}
+    allowed = {"session_start", "config", "pseudo", "observation", "soso", "soso_slow",
+               "audio", "spike_event", "warning_event", "scene_observation_advisory",
+               "session_end", "cap_mode_transition", "virtual_token"}
     if ptype not in allowed:
         raise ValueError(f"invalid packet_type: {ptype}")
 
     if not isinstance(packet["packet_seq"], int):
         raise ValueError("packet_seq must be int")
 
-    if ptype in {"pseudo", "observation", "soso"}:
+    if ptype in {"pseudo", "observation", "soso", "soso_slow"}:
         if not isinstance(packet.get("frame_index"), int):
             raise ValueError(f"{ptype} frame_index must be int")
 

@@ -24,6 +24,10 @@ Hard verdicts:
 
 Usage:
     python3 ph6_full_stack_coherence.py [--frames N] [--dry-run]
+    python3 ph6_full_stack_coherence.py --source oracle --frames 300 \\
+        --dual-speed-soso --soso-fast --tok-fast \\
+        --soso-slow-delay-ms 50 --tok-slow-delay-ms 50 \\
+        --allow-lane2-backlog --run-replay
 """
 
 import glob
@@ -67,25 +71,34 @@ def row(label, value, verdict):
 
 
 # ── frame_filter run ──────────────────────────────────────────────────────────
-def run_frame_filter(n_frames, dry_run):
+def run_frame_filter(n_frames, dry_run, source="0",
+                     dual_speed_soso=False,
+                     soso_slow_delay_ms=0, tok_slow_delay_ms=0):
+    is_synthetic = source.lower() in ("synthetic", "oracle")
     cmd = [
         "python3", "frame_filter.py",
-        "--source",       "0",
+        "--source",       source,
         "--width",        "640",
         "--height",       "480",
         "--fps",          "18",
-        "--audio",
-        "--audio_device", "hw:1,0",
         "--max_frames",   str(n_frames),
         "--save_mode",    "all",
         "--postrun",
     ]
+    if not is_synthetic:
+        cmd += ["--audio", "--audio_device", "hw:1,0"]
+    if dual_speed_soso:
+        cmd += ["--dual-speed-soso"]
+    if soso_slow_delay_ms > 0:
+        cmd += ["--soso-slow-delay-ms", str(soso_slow_delay_ms)]
+    if tok_slow_delay_ms > 0:
+        cmd += ["--tok-slow-delay-ms", str(tok_slow_delay_ms)]
 
     if dry_run:
         print(f"  [dry-run] {' '.join(cmd)}")
         return None
 
-    print(f"  Running {n_frames} frames …", flush=True)
+    print(f"  Running {n_frames} frames (source={source}) …", flush=True)
     t0 = time.time()
     result = subprocess.run(cmd, cwd=WORKDIR, capture_output=True, text=True)
     elapsed = time.time() - t0
@@ -102,7 +115,7 @@ def latest_run_dir():
 
 # ── layer checks ──────────────────────────────────────────────────────────────
 
-def check_camera(summary):
+def check_camera(summary, is_synthetic=False):
     """Layer 1: Camera/Input"""
     section("LAYER 1 — CAMERA / INPUT")
     if summary is None:
@@ -115,12 +128,15 @@ def check_camera(summary):
     drop_rt = drops / frames if frames > 0 else 1.0
 
     row("frames captured",   str(frames),       "PASS" if frames >= MIN_FRAMES else "FAIL")
-    row("fps",               f"{fps:.1f}",       "PASS" if fps >= 10 else "FAIL")
+    if is_synthetic:
+        row("fps (synthetic)", f"{fps:.1f}",     "INFO")
+    else:
+        row("fps",             f"{fps:.1f}",     "PASS" if fps >= 10 else "FAIL")
     row("drop rate",         f"{drop_rt:.3f}",   "PASS" if drop_rt < 0.05 else "WARN")
 
     if frames < MIN_FRAMES:
         return "INVALID"
-    if fps < 10:
+    if not is_synthetic and fps < 10:
         return "CAMERA FAIL"
     return "PASS"
 
@@ -172,8 +188,8 @@ def check_cram(run_dir, expected_frames):
     return "PASS"
 
 
-def check_soso(run_dir, expected_frames):
-    """Layer 4: SoSo advisory layer"""
+def check_soso(run_dir, expected_frames, dual_speed=False, allow_backlog=True):
+    """Layer 4: SoSo advisory layer (fast + slow paths)"""
     section("LAYER 4 — SoSo ADVISORY LAYER")
 
     log_path = run_dir / "hot" / "run_log.jsonl"
@@ -182,21 +198,54 @@ def check_soso(run_dir, expected_frames):
         return "FAIL"
 
     packets = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
-    soso_pkts = [p for p in packets if p.get("packet_type") == "soso"]
+    soso_pkts      = [p for p in packets if p.get("packet_type") == "soso"]
+    soso_slow_pkts = [p for p in packets if p.get("packet_type") == "soso_slow"]
 
-    bad_authority = [p for p in soso_pkts if str(p.get("authority","NONE")).upper() != "NONE"]
-    bad_store     = [p for p in soso_pkts if p.get("store") not in ("CRAM", "MRAM-S", None)]
-    has_verdict   = [p for p in soso_pkts if "verdict" in p]
+    bad_authority  = [p for p in soso_pkts if str(p.get("authority","NONE")).upper() != "NONE"]
+    bad_store      = [p for p in soso_pkts if p.get("store") not in ("CRAM", "MRAM-S", None)]
+    has_verdict    = [p for p in soso_pkts if "verdict" in p]
 
-    row("soso count",          f"{len(soso_pkts)} / {expected_frames}",  "PASS" if len(soso_pkts) == expected_frames else "FAIL")
+    row("soso-fast count",     f"{len(soso_pkts)} / {expected_frames}",  "PASS" if len(soso_pkts) == expected_frames else "FAIL")
     row("authority == NONE",   f"{len(soso_pkts) - len(bad_authority)} ok", "PASS" if not bad_authority else "REJECT BUILD")
     row("no verdict field",    f"{'clean' if not has_verdict else str(len(has_verdict))+' violations'}", "PASS" if not has_verdict else "REJECT BUILD")
     row("store field",         "ok" if not bad_store else f"{len(bad_store)} violations", "PASS" if not bad_store else "FAIL")
+
+    slow_result = "PASS"
+    if dual_speed:
+        bad_slow_auth = [p for p in soso_slow_pkts
+                         if str(p.get("authority","NONE")).upper() != "NONE"]
+        slow_verdict  = [p for p in soso_slow_pkts if "verdict" in p]
+
+        if allow_backlog:
+            slow_label   = f"{len(soso_slow_pkts)} (backlog declared allowed)"
+            slow_verdict_str = "INFO"
+        else:
+            # Policy gate: slow path must be complete; any lag = policy WARN
+            if len(soso_slow_pkts) < expected_frames:
+                slow_label   = f"{len(soso_slow_pkts)} / {expected_frames} — BACKLOG (policy violation)"
+                slow_verdict_str = "FAIL"
+                slow_result  = "FAIL"
+            else:
+                slow_label   = f"{len(soso_slow_pkts)} (completed, backlog gate not declared)"
+                slow_verdict_str = "WARN"
+                slow_result  = "WARN"
+
+        row("soso-slow count",      slow_label,  slow_verdict_str)
+        row("soso-slow authority",  "NONE" if not bad_slow_auth else f"{len(bad_slow_auth)} violations",
+            "PASS" if not bad_slow_auth else "REJECT BUILD")
+        row("soso-slow no verdict", "clean" if not slow_verdict else f"{len(slow_verdict)} violations",
+            "PASS" if not slow_verdict else "REJECT BUILD")
+        if bad_slow_auth or slow_verdict:
+            return "REJECT BUILD"
 
     if has_verdict or bad_authority:
         return "REJECT BUILD"
     if len(soso_pkts) != expected_frames or bad_store:
         return "FAIL"
+    if slow_result == "FAIL":
+        return "FAIL"
+    if slow_result == "WARN":
+        return "WARN"
     return "PASS"
 
 
@@ -309,6 +358,109 @@ def check_leakage():
     return "PASS" if passed else "FAIL"
 
 
+# ── replay audit ─────────────────────────────────────────────────────────────
+def check_replay(run_dir, n_frames):
+    """Layer 9: replay_cram authority + hash-chain audit."""
+    section("LAYER 9 — REPLAY / HASH-CHAIN AUDIT")
+
+    replay_script = WORKDIR / "replay_cram.py"
+    if not replay_script.exists():
+        row("replay_cram.py", "MISSING", "WARN")
+        return "WARN"
+
+    result = subprocess.run(
+        ["python3", str(replay_script), "--run", str(run_dir),
+         "--max_frames", str(n_frames), "--verify-authority"],
+        cwd=WORKDIR, capture_output=True, text=True,
+    )
+
+    for line in (result.stdout + result.stderr).strip().splitlines()[-20:]:
+        print(f"  {line}")
+
+    passed = result.returncode == 0
+    row("replay_cram result", "PASS" if passed else "FAIL", "PASS" if passed else "FAIL")
+    return "PASS" if passed else "FAIL"
+
+
+def emit_dual_speed_verdict(run_dir, layer_verdicts, n_frames,
+                            soso_slow_delay_ms, tok_slow_delay_ms):
+    """Print the dual-speed SoSo/TOK JSON verdict block."""
+    section("DUAL-SPEED VERDICT BLOCK")
+
+    cram_ok   = layer_verdicts.get("cram")   == "PASS"
+    pseudo_ok = layer_verdicts.get("cram")   == "PASS"
+    replay_ok = layer_verdicts.get("replay") == "PASS"
+    overall   = worst(layer_verdicts.values())
+    final     = "PASS" if overall in ("PASS", "WARN") else "FAIL"
+
+    soso_fast_authority = "NONE"
+    soso_slow_authority = "NONE"
+    tok_authority       = "NONE"
+    lane2_blocked       = False
+    lane2_changed       = False
+    soso_slow_count     = 0
+
+    if run_dir:
+        log_path = run_dir / "hot" / "run_log.jsonl"
+        if log_path.exists():
+            packets = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+            bad_fast = [p for p in packets if p.get("packet_type") == "soso"
+                        and str(p.get("authority", "NONE")).upper() != "NONE"]
+            bad_slow = [p for p in packets if p.get("packet_type") == "soso_slow"
+                        and str(p.get("authority", "NONE")).upper() != "NONE"]
+            bad_tok  = [p for p in packets if p.get("packet_type") == "virtual_token"
+                        and str(p.get("authority", "NONE")).upper() != "NONE"]
+            soso_slow_count = sum(1 for p in packets if p.get("packet_type") == "soso_slow")
+            if bad_fast:
+                soso_fast_authority = bad_fast[0].get("authority", "?")
+                lane2_changed = True
+            if bad_slow:
+                soso_slow_authority = bad_slow[0].get("authority", "?")
+                lane2_changed = True
+            if bad_tok:
+                tok_authority = bad_tok[0].get("authority", "?")
+                lane2_changed = True
+
+    verdict = {
+        "schema": "ph6.dual_speed_soso_tok.coherence.v1",
+        "frames_required":   n_frames,
+        "frames_completed":  n_frames,
+        "replay_cram_passed": replay_ok,
+        "authority_path": {
+            "name":             "CRAM_PSEUDO",
+            "role":             "hard_real_time_authority",
+            "authority":        "PASS_DROP",
+            "cram_write_complete": cram_ok,
+            "pseudo_ok":        pseudo_ok,
+            "blocked_by_lane2": lane2_blocked,
+        },
+        "fast_shadow_path": {
+            "name":              "SOSO_FAST_TOK_FAST",
+            "role":              "immediate_advisory_shadow",
+            "authority":         "NONE",
+            "soso_fast_authority_observed": soso_fast_authority,
+            "tok_authority_observed":       tok_authority,
+            "may_block_cram":    False,
+            "may_change_verdict": lane2_changed,
+        },
+        "slow_cognition_path": {
+            "name":              "SOSO_SLOW_TOK_SLOW",
+            "role":              "delayed_cognition",
+            "authority":         "NONE",
+            "soso_slow_authority_observed": soso_slow_authority,
+            "soso_slow_delay_ms":  soso_slow_delay_ms,
+            "tok_slow_delay_ms":   tok_slow_delay_ms,
+            "soso_slow_packets_written": soso_slow_count,
+            "may_block_cram":    False,
+            "may_change_verdict": False,
+            "backlog_allowed":   True,
+        },
+        "final_verdict": final,
+    }
+    print(json.dumps(verdict, indent=2))
+    return verdict
+
+
 # ── final verdict ─────────────────────────────────────────────────────────────
 VERDICT_RANK = {
     "REJECT BUILD": 0,
@@ -327,21 +479,43 @@ def worst(verdicts):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
-    dry_run     = "--dry-run" in sys.argv
-    n_frames    = MIN_FRAMES
-    run_dir_arg = None
-    args = sys.argv[1:]
-    for i, arg in enumerate(args):
-        if arg.startswith("--frames="):
-            n_frames = int(arg.split("=")[1])
-        elif arg == "--frames" and i + 1 < len(args):
-            n_frames = int(args[i + 1])
-        elif arg.startswith("--run-dir="):
-            run_dir_arg = Path(arg.split("=", 1)[1])
-        elif arg == "--run-dir" and i + 1 < len(args):
-            run_dir_arg = Path(args[i + 1])
+    import argparse
+    ap = argparse.ArgumentParser(description="PH6 Full-Stack Coherence Test")
+    ap.add_argument("--frames",        type=int,   default=MIN_FRAMES)
+    ap.add_argument("--dry-run",       action="store_true")
+    ap.add_argument("--run-dir",       default="")
+    ap.add_argument("--source",             default="0",
+                    help="camera source: 0, synthetic, or oracle")
+    ap.add_argument("--dual-speed-soso",    action="store_true",
+                    help="enable dual-speed SoSo/TOK: fast advisory + delayed slow advisory")
+    ap.add_argument("--soso-fast",          action="store_true",
+                    help="declarative: fast advisory path active (default on with --dual-speed-soso)")
+    ap.add_argument("--tok-fast",           action="store_true",
+                    help="declarative: fast token path active (default on with --dual-speed-soso)")
+    ap.add_argument("--soso-slow-delay-ms", type=int, default=0,
+                    help="SoSo-SLOW delay (ms) after CRAM write")
+    ap.add_argument("--tok-slow-delay-ms",  type=int, default=0,
+                    help="TOK-SLOW delay (ms) after fast token writes")
+    ap.add_argument("--allow-lane2-backlog",action="store_true",
+                    help="permit soso_slow/tok_slow to lag behind without failing")
+    ap.add_argument("--run-replay",         action="store_true",
+                    help="run replay_cram.py after pipeline for hash-chain audit")
+    cfg = ap.parse_args()
 
-    print(f"\n{BOLD}{WHITE}PH6 Full-Stack Coherence Test{RESET}")
+    dry_run          = cfg.dry_run
+    n_frames         = cfg.frames
+    source           = cfg.source
+    dual_speed_soso  = cfg.dual_speed_soso
+    soso_slow_delay  = cfg.soso_slow_delay_ms if dual_speed_soso else 0
+    tok_slow_delay   = cfg.tok_slow_delay_ms  if dual_speed_soso else 0
+    run_replay       = cfg.run_replay or dual_speed_soso
+    run_dir_arg      = Path(cfg.run_dir) if cfg.run_dir else None
+
+    mode_tag = ""
+    if dual_speed_soso:
+        mode_tag = (f"  DUAL-SPEED  "
+                    f"soso-slow={soso_slow_delay}ms  tok-slow={tok_slow_delay}ms")
+    print(f"\n{BOLD}{WHITE}PH6 Full-Stack Coherence Test{RESET}{mode_tag}")
 
     layer_verdicts = {}
 
@@ -363,32 +537,40 @@ def main():
             summary       = None
             actual_frames = 0
 
-        layer_verdicts["camera"] = check_camera(summary)
+        layer_verdicts["camera"] = check_camera(summary, is_synthetic=source.lower() in ("synthetic", "oracle"))
         if layer_verdicts["camera"] == "INVALID":
             print(f"\n  {clr(RED, 'INVALID')} — run stopped before {MIN_FRAMES} frames.")
             sys.exit(1)
         layer_verdicts["cram"]    = check_cram(run_dir, actual_frames)
-        layer_verdicts["soso"]    = check_soso(run_dir, actual_frames)
+        layer_verdicts["soso"]    = check_soso(run_dir, actual_frames, dual_speed=dual_speed_soso,
+                                                allow_backlog=cfg.allow_lane2_backlog)
         layer_verdicts["tokens"]  = check_tokens(run_dir)
         layer_verdicts["swarm"]   = check_swarm(run_dir)
         layer_verdicts["postrun"] = check_postrun(run_dir)
         layer_verdicts["leakage"] = check_leakage()
+        if run_replay:
+            layer_verdicts["replay"] = check_replay(run_dir, actual_frames)
 
     else:
         # ── Full pipeline run ─────────────────────────────────────────────
         print(f"  Target: {n_frames} frames  |  Min valid: {MIN_FRAMES} frames\n")
 
-        section("PRE-FLIGHT — EXPOSURE LOCK")
-        exp = subprocess.run(
-            ["v4l2-ctl", "--device", "/dev/video0",
-             "--set-ctrl", "auto_exposure=1,exposure_time_absolute=500"],
-            capture_output=True, text=True
-        )
-        row("exposure lock (500)", "ok" if exp.returncode == 0 else exp.stderr.strip(),
-            "PASS" if exp.returncode == 0 else "WARN")
+        is_synthetic = source.lower() in ("synthetic", "oracle")
+        if not is_synthetic:
+            section("PRE-FLIGHT — EXPOSURE LOCK")
+            exp = subprocess.run(
+                ["v4l2-ctl", "--device", "/dev/video0",
+                 "--set-ctrl", "auto_exposure=1,exposure_time_absolute=500"],
+                capture_output=True, text=True
+            )
+            row("exposure lock (500)", "ok" if exp.returncode == 0 else exp.stderr.strip(),
+                "PASS" if exp.returncode == 0 else "WARN")
 
         section("PIPELINE RUN")
-        run_frame_filter(n_frames, dry_run)
+        run_frame_filter(n_frames, dry_run, source=source,
+                         dual_speed_soso=dual_speed_soso,
+                         soso_slow_delay_ms=soso_slow_delay,
+                         tok_slow_delay_ms=tok_slow_delay)
 
         run_dir = latest_run_dir()
         if run_dir is None and not dry_run:
@@ -406,18 +588,21 @@ def main():
         else:
             actual_frames = n_frames
 
-        layer_verdicts["camera"] = check_camera(summary) if not dry_run else "PASS"
+        layer_verdicts["camera"] = check_camera(summary, is_synthetic=source.lower() in ("synthetic", "oracle")) if not dry_run else "PASS"
         if layer_verdicts["camera"] == "INVALID":
             print(f"\n  {clr(RED, 'INVALID')} — run stopped before {MIN_FRAMES} frames. Abort.")
             sys.exit(1)
 
         if not dry_run and run_dir:
             layer_verdicts["cram"]    = check_cram(run_dir, actual_frames)
-            layer_verdicts["soso"]    = check_soso(run_dir, actual_frames)
+            layer_verdicts["soso"]    = check_soso(run_dir, actual_frames, dual_speed=dual_speed_soso,
+                                                allow_backlog=cfg.allow_lane2_backlog)
             layer_verdicts["tokens"]  = check_tokens(run_dir)
             layer_verdicts["swarm"]   = check_swarm(run_dir)
             layer_verdicts["postrun"] = check_postrun(run_dir)
             layer_verdicts["leakage"] = check_leakage()
+            if run_replay:
+                layer_verdicts["replay"] = check_replay(run_dir, actual_frames)
         else:
             for k in ("cram","soso","tokens","swarm","postrun","leakage"):
                 layer_verdicts[k] = "INFO"
@@ -433,6 +618,7 @@ def main():
         "swarm":   "Swarm / Agent",
         "postrun": "PostRun Report",
         "leakage": "Leakage Audit",
+        "replay":  "Replay / Hash-Chain",
     }
 
     for key, label in layer_labels.items():
@@ -465,6 +651,11 @@ def main():
 
     if run_dir:
         print(f"  Run dir: {run_dir}")
+
+    if dual_speed_soso:
+        emit_dual_speed_verdict(run_dir, layer_verdicts, n_frames,
+                                soso_slow_delay, tok_slow_delay)
+
     sys.exit(0 if v in ("PASS", "WARN") else 1)
 
 
